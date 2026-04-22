@@ -9,3 +9,4 @@ src/build
 assets/
 .codex
 image_eval/__pycache__/
+ADVICE.md
