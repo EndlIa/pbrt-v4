@@ -1,130 +1,115 @@
 
-#ifndef PBRT_PATHGRAPH_H
-#define PBRT_PATHGRAPH_H
-
+#pragma once
 #include <pbrt/pbrt.h>
 
+#include <pbrt/base/bxdf.h>
 #include <pbrt/util/pstd.h>
+#include <pbrt/util/spectrum.h>
 #include <pbrt/util/vecmath.h>
 
 #include <cstdint>
 #include <memory>
 
+
 namespace pbrt {
 
-using PathId = uint64_t;
-using VertexId = uint64_t;
-
-struct RGB3f {
-    Float r = 0;
-    Float g = 0;
-    Float b = 0;
-};
-
-/// x_j: shading point j
-struct SurfaceVertexRecord {
-    VertexId vertexId = 0;
-    PathId pathId = 0;
+struct SurfaceVertex {
+    uint64_t vertexId = 0;
+    uint64_t pathId = 0;
     uint32_t depth = 0;
 
     Point3f pos;
-    Normal3f normal;
+    Normal3f geometricNormal;
+    Normal3f shadingNormal;
     Vector3f wo;
 
-    RGB3f albedo;
-
-    // Stable identifiers; avoid storing raw BSDF pointers.
+    /// use type index to avoid storing raw BSDF pointers.
     uint32_t bsdfType = 0;
     int32_t materialId = -1;
     int32_t shapeId = -1;
 
-    // Continuation-sampling data (leave as 0 if unavailable).
-    Float pdfBsdf = 0;
+    /// detailed bxdf flags
+    BxDFFlags bsdfFlags = BxDFFlags::Unset;
+    bool bsdfRegularized = false;
 };
 
-  // NEE connection
-struct LightEdgeRecord {
-    VertexId fromVertexId = 0;
+struct LightEdge {
+    uint64_t fromVertexId = 0;
     Vector3f wi;
-
-    RGB3f L;
-    // fCos = BSDF(wi) * |n . wi| for direct reuse in post-processing.
-    RGB3f fCos;
-
-    Float pdfLight = 0;
-    Float pdfSelectLight = 1;
-    Float pdfBsdfForWi = 0;
-
-    // Keep fixed at 1 in the SimplePath stage.
+    SampledSpectrum L;  ///emit radiance
+    // ef = AbsDot(shadingNormal, wi)
+    //    = radiance transfer coefficient at the edge
+    SampledSpectrum ef;
+    Float pdf = 0;
     Float misWeight = 1;
-    uint8_t misMode = 0;
+
+    ///detailed flags
+    bool isDeltaLight = false;
 };
 
-  // Path continuation edge
-struct ContEdgeRecord {
-    VertexId fromVertexId = 0;
-    VertexId toVertexId = 0;
+struct ContEdge {
+    uint64_t fromVertexId = 0;
+    uint64_t toVertexId = 0;
     Vector3f wi;
 
-    Float pdfBsdf = 0;
+    // ef = BSDF(wo, wi) * AbsDot(shadingNormal, wi)
+    //    = radiance transfer coefficient at the edge
+    SampledSpectrum ef;
 
-    // If RR is disabled, use q=1 and invQ=1.
-    Float q = 1;
-    Float invQ = 1;
+    Float pdf = 0;
+    Float rrQ = 0;  // Russian roulette die probability
+    
+    /// detailed flags
+    BxDFFlags flags = BxDFFlags::Unset;
+    Float eta = 1;  // relative refractive index
 };
 
-  // Adjacency edge after clustering
-struct NeighborEdgeRecord {
-    VertexId a = 0;
-    VertexId b = 0;
+struct NeighborEdge {
+    uint64_t a = 0;
+    uint64_t b = 0;
     int32_t clusterId = -1;
 
+    /// maybe useless ...
     Float distance = 0;
     Float weight = 1;
 };
 
-// Read-only snapshot interface for post-processing
+// Read-only snapshot interface 
 class PathGraphSnapshot {
   public:
     virtual ~PathGraphSnapshot() = default;
-
-    virtual pstd::span<const SurfaceVertexRecord> Vertices() const = 0;
-    virtual pstd::span<const LightEdgeRecord> LightEdges() const = 0;
-    virtual pstd::span<const ContEdgeRecord> ContEdges() const = 0;
-    virtual pstd::span<const NeighborEdgeRecord> NeighborEdges() const = 0;
+    virtual pstd::span<const SurfaceVertex> Vertices() const = 0;
+    virtual pstd::span<const LightEdge> LightEdges() const = 0;
+    virtual pstd::span<const ContEdge> ContEdges() const = 0;
+    virtual pstd::span<const NeighborEdge> NeighborEdges() const = 0;
 };
 
-// Capture interface: called by the Integrator in the main loop
-class IPathGraphSink {
+// Capture interface: called by Integrator 
+class PathGraphSink {
   public:
-    virtual ~IPathGraphSink() = default;
-
-    virtual void BeginPath(PathId pathId) = 0;
-    virtual void AddSurfaceVertex(const SurfaceVertexRecord &v) = 0;
-    virtual void AddLightEdge(const LightEdgeRecord &e) = 0;
-    virtual void AddContEdge(const ContEdgeRecord &e) = 0;
-    virtual void EndPath(PathId pathId) = 0;
+    virtual ~PathGraphSink() = default;
+    virtual void BeginPath(uint64_t pathId) = 0;
+    virtual void AddSurfaceVertex(const SurfaceVertex &v) = 0;
+    virtual void AddLightEdge(const LightEdge &e) = 0;
+    virtual void AddContEdge(const ContEdge &e) = 0;
+    virtual void EndPath(uint64_t pathId) = 0;
 };
 
-// Builder interface: implementation may use TLS buffers and merge
 class PathGraphBuilder {
   public:
     virtual ~PathGraphBuilder() = default;
-
-    virtual IPathGraphSink *GetThreadLocalSink() = 0;
+    virtual PathGraphSink *GetThreadLocalSink() = 0;
     virtual std::shared_ptr<const PathGraphSnapshot> BuildSnapshot() = 0;
 };
 
 // Zero-overhead placeholder when capture is disabled
-class NoopPathGraphSink : public IPathGraphSink {
+class NoopPathGraphSink : public PathGraphSink {
   public:
-    void BeginPath(PathId) override {}
-    void AddSurfaceVertex(const SurfaceVertexRecord &) override {}
-    void AddLightEdge(const LightEdgeRecord &) override {}
-    void AddContEdge(const ContEdgeRecord &) override {}
-    void EndPath(PathId) override {}
+    void BeginPath(uint64_t) override {}
+    void AddSurfaceVertex(const SurfaceVertex &) override {}
+    void AddLightEdge(const LightEdge &) override {}
+    void AddContEdge(const ContEdge &) override {}
+    void EndPath(uint64_t) override {}
 };
 
 }  
-
-#endif  // PBRT_PATHGRAPH_H
