@@ -547,6 +547,7 @@ set (PBRT_SOURCE
   src/pbrt/options.cpp
   src/pbrt/paramdict.cpp
   src/pbrt/parser.cpp
+  src/pbrt/pathGraph.cpp
   src/pbrt/pbrt.cpp
   src/pbrt/ray.cpp
   src/pbrt/samplers.cpp

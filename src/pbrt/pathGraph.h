@@ -24,13 +24,10 @@ struct SurfaceVertex {
     Vector3f wo;
 
     /// use type index to avoid storing raw BSDF pointers.
-    uint32_t bsdfType = 0;
     int32_t materialId = -1;
-    int32_t shapeId = -1;
 
     /// detailed bxdf flags
     BxDFFlags bsdfFlags = BxDFFlags::Unset;
-    bool bsdfRegularized = false;
 };
 
 struct LightEdge {
@@ -43,7 +40,7 @@ struct LightEdge {
     Float pdf = 0;
     Float misWeight = 1;
 
-    ///detailed flags
+    /// maybe useless ...
     bool isDeltaLight = false;
 };
 
@@ -59,7 +56,7 @@ struct ContEdge {
     Float pdf = 0;
     Float rrQ = 0;  // Russian roulette die probability
     
-    /// detailed flags
+    /// maybe useless ...
     BxDFFlags flags = BxDFFlags::Unset;
     Float eta = 1;  // relative refractive index
 };
@@ -101,6 +98,22 @@ class PathGraphBuilder {
     virtual PathGraphSink *GetThreadLocalSink() = 0;
     virtual std::shared_ptr<const PathGraphSnapshot> BuildSnapshot() = 0;
 };
+
+class BasicPathGraphBuilder : public PathGraphBuilder {
+  public:
+    BasicPathGraphBuilder();
+    ~BasicPathGraphBuilder() override;
+
+    PathGraphSink *GetThreadLocalSink() override;
+    std::shared_ptr<const PathGraphSnapshot> BuildSnapshot() override;
+
+  private:
+    class Impl;
+    std::unique_ptr<Impl> impl;
+};
+
+PathGraphBuilder *GetActivePathGraphBuilder();
+void SetActivePathGraphBuilder(PathGraphBuilder *builder);
 
 // Zero-overhead placeholder when capture is disabled
 class NoopPathGraphSink : public PathGraphSink {

@@ -6,6 +6,7 @@ src/build
 .ipynb_checkpoints/
 *build*/
 .cache/
+
 assets/
 .codex
 image_eval/__pycache__/
