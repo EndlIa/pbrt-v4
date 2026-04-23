@@ -15,6 +15,8 @@ namespace pbrt {
 
 struct SurfaceVertex {
     uint64_t vertexId = 0;
+    SampledSpectrum L_in = SampledSpectrum(0.f);
+    SampledSpectrum L_out = SampledSpectrum(0.f);
     uint64_t pathId = 0;
     uint32_t depth = 0;
 
@@ -31,9 +33,9 @@ struct SurfaceVertex {
 };
 
 struct LightEdge {
-    uint64_t fromVertexId = 0;
+    uint64_t vertexA = 0;
     Vector3f wi;
-    SampledSpectrum L;  ///emit radiance
+    SampledSpectrum L_B;  ///emit radiance
     // ef = AbsDot(shadingNormal, wi)
     //    = radiance transfer coefficient at the edge
     SampledSpectrum ef;
@@ -45,8 +47,9 @@ struct LightEdge {
 };
 
 struct ContEdge {
-    uint64_t fromVertexId = 0;
-    uint64_t toVertexId = 0;
+    uint64_t vertexA = 0;
+    uint64_t vertexB = 0;
+    SampledSpectrum L_B = SampledSpectrum(0.f);
     Vector3f wi;
 
     // ef = BSDF(wo, wi) * AbsDot(shadingNormal, wi)
@@ -61,16 +64,6 @@ struct ContEdge {
     Float eta = 1;  // relative refractive index
 };
 
-struct NeighborEdge {
-    uint64_t a = 0;
-    uint64_t b = 0;
-    int32_t clusterId = -1;
-
-    /// maybe useless ...
-    Float distance = 0;
-    Float weight = 1;
-};
-
 // Read-only snapshot interface 
 class PathGraphSnapshot {
   public:
@@ -78,7 +71,9 @@ class PathGraphSnapshot {
     virtual pstd::span<const SurfaceVertex> Vertices() const = 0;
     virtual pstd::span<const LightEdge> LightEdges() const = 0;
     virtual pstd::span<const ContEdge> ContEdges() const = 0;
-    virtual pstd::span<const NeighborEdge> NeighborEdges() const = 0;
+    virtual pstd::span<const uint32_t> ContEdgesIntoVertex(uint64_t vertexId) const = 0;
+    virtual pstd::span<const uint32_t> LightEdgesOfVertex(uint64_t vertexId) const = 0;
+    virtual pstd::span<const uint64_t> NeighborsOfVertex(uint64_t vertexId) const = 0;
 };
 
 // Capture interface: called by Integrator 
@@ -124,5 +119,9 @@ class NoopPathGraphSink : public PathGraphSink {
     void AddContEdge(const ContEdge &) override {}
     void EndPath(uint64_t) override {}
 };
+
+void ClusterPathGraph() {
+
+}
 
 }  

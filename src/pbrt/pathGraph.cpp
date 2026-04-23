@@ -1,5 +1,6 @@
 #include <pbrt/pathGraph.h>
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <vector>
@@ -15,24 +16,58 @@ class BasicPathGraphSnapshot final : public PathGraphSnapshot {
     BasicPathGraphSnapshot(std::vector<SurfaceVertex> vertices,
                            std::vector<LightEdge> lightEdges,
                            std::vector<ContEdge> contEdges,
-                           std::vector<NeighborEdge> neighborEdges)
+                           std::vector<uint32_t> contEdgeOffsets,
+                           std::vector<uint32_t> contEdgeIndices,
+                           std::vector<uint32_t> lightEdgeOffsets,
+                           std::vector<uint32_t> lightEdgeIndices,
+                           std::vector<uint32_t> neighborOffsets,
+                           std::vector<uint64_t> neighborVertexIds)
         : vertices(std::move(vertices)),
           lightEdges(std::move(lightEdges)),
           contEdges(std::move(contEdges)),
-          neighborEdges(std::move(neighborEdges)) {}
+          contEdgeOffsets(std::move(contEdgeOffsets)),
+          contEdgeIndices(std::move(contEdgeIndices)),
+          lightEdgeOffsets(std::move(lightEdgeOffsets)),
+          lightEdgeIndices(std::move(lightEdgeIndices)),
+          neighborOffsets(std::move(neighborOffsets)),
+          neighborVertexIds(std::move(neighborVertexIds)) {}
 
     pstd::span<const SurfaceVertex> Vertices() const override { return vertices; }
     pstd::span<const LightEdge> LightEdges() const override { return lightEdges; }
     pstd::span<const ContEdge> ContEdges() const override { return contEdges; }
-    pstd::span<const NeighborEdge> NeighborEdges() const override {
-        return neighborEdges;
+    pstd::span<const uint32_t> ContEdgesIntoVertex(uint64_t vertexId) const override {
+        return SliceAdjacency(contEdgeOffsets, contEdgeIndices, vertexId);
+    }
+    pstd::span<const uint32_t> LightEdgesOfVertex(uint64_t vertexId) const override {
+        return SliceAdjacency(lightEdgeOffsets, lightEdgeIndices, vertexId);
+    }
+    pstd::span<const uint64_t> NeighborsOfVertex(uint64_t vertexId) const override {
+        return SliceAdjacency(neighborOffsets, neighborVertexIds, vertexId);
     }
 
   private:
+    template <typename T>
+    pstd::span<const T> SliceAdjacency(const std::vector<uint32_t> &offsets,
+                                       const std::vector<T> &values,
+                                       uint64_t vertexId) const {
+        if (vertexId + 1 >= offsets.size())
+            return {};
+        uint32_t begin = offsets[vertexId];
+        uint32_t end = offsets[vertexId + 1];
+        if (begin == end)
+            return {};
+        return pstd::span<const T>(values.data() + begin, end - begin);
+    }
+
     std::vector<SurfaceVertex> vertices;
     std::vector<LightEdge> lightEdges;
     std::vector<ContEdge> contEdges;
-    std::vector<NeighborEdge> neighborEdges;
+    std::vector<uint32_t> contEdgeOffsets;
+    std::vector<uint32_t> contEdgeIndices;
+    std::vector<uint32_t> lightEdgeOffsets;
+    std::vector<uint32_t> lightEdgeIndices;
+    std::vector<uint32_t> neighborOffsets;
+    std::vector<uint64_t> neighborVertexIds;
 };
 
 }  // namespace
@@ -58,7 +93,7 @@ class BasicPathGraphBuilder::Impl {
             stored.vertexId = stored.vertexId != 0 ? stored.vertexId
                                                    : owner->nextVertexId.fetch_add(1);
             if (pendingContEdge) {
-                pendingContEdge->toVertexId = stored.vertexId;
+                pendingContEdge->vertexB = stored.vertexId;
                 contEdges.push_back(*pendingContEdge);
                 pendingContEdge.reset();
             }
@@ -71,8 +106,8 @@ class BasicPathGraphBuilder::Impl {
                 BeginPath(0);
 
             LightEdge stored = e;
-            if (stored.fromVertexId == 0)
-                stored.fromVertexId = lastVertexId;
+            if (stored.vertexA == 0)
+                stored.vertexA = lastVertexId;
             lightEdges.push_back(stored);
         }
 
@@ -81,9 +116,9 @@ class BasicPathGraphBuilder::Impl {
                 BeginPath(0);
 
             ContEdge stored = e;
-            if (stored.fromVertexId == 0)
-                stored.fromVertexId = lastVertexId;
-            if (stored.toVertexId == 0)
+            if (stored.vertexA == 0)
+                stored.vertexA = lastVertexId;
+            if (stored.vertexB == 0)
                 pendingContEdge = stored;
             else
                 contEdges.push_back(stored);
@@ -145,9 +180,55 @@ class BasicPathGraphBuilder::Impl {
                                     sink->contEdges.end());
             }
         }
+
+        uint64_t maxVertexId = 0;
+        for (const SurfaceVertex &v : allVertices)
+            maxVertexId = std::max(maxVertexId, v.vertexId);
+        for (const LightEdge &e : allLightEdges)
+            maxVertexId = std::max(maxVertexId, e.vertexA);
+        for (const ContEdge &e : allContEdges) {
+            maxVertexId = std::max(maxVertexId, e.vertexA);
+            maxVertexId = std::max(maxVertexId, e.vertexB);
+        }
+
+        std::vector<uint32_t> contEdgeOffsets(maxVertexId + 2, 0);
+        std::vector<uint32_t> lightEdgeOffsets(maxVertexId + 2, 0);
+        std::vector<uint32_t> neighborOffsets(maxVertexId + 2, 0);
+
+        for (const ContEdge &e : allContEdges)
+            ++contEdgeOffsets[e.vertexB + 1];
+        for (const LightEdge &e : allLightEdges)
+            ++lightEdgeOffsets[e.vertexA + 1];
+
+        for (size_t i = 1; i < contEdgeOffsets.size(); ++i)
+            contEdgeOffsets[i] += contEdgeOffsets[i - 1];
+        for (size_t i = 1; i < lightEdgeOffsets.size(); ++i)
+            lightEdgeOffsets[i] += lightEdgeOffsets[i - 1];
+        for (size_t i = 1; i < neighborOffsets.size(); ++i)
+            neighborOffsets[i] += neighborOffsets[i - 1];
+
+        std::vector<uint32_t> contEdgeIndices(allContEdges.size());
+        std::vector<uint32_t> lightEdgeIndices(allLightEdges.size());
+        std::vector<uint64_t> neighborVertexIds(neighborOffsets.back());
+
+        std::vector<uint32_t> contEdgeCursor = contEdgeOffsets;
+        std::vector<uint32_t> lightEdgeCursor = lightEdgeOffsets;
+        std::vector<uint32_t> neighborCursor = neighborOffsets;
+
+        for (uint32_t i = 0; i < allContEdges.size(); ++i) {
+            const ContEdge &e = allContEdges[i];
+            contEdgeIndices[contEdgeCursor[e.vertexB]++] = i;
+        }
+        for (uint32_t i = 0; i < allLightEdges.size(); ++i) {
+            const LightEdge &e = allLightEdges[i];
+            lightEdgeIndices[lightEdgeCursor[e.vertexA]++] = i;
+        }
+
         return std::make_shared<BasicPathGraphSnapshot>(
             std::move(allVertices), std::move(allLightEdges), std::move(allContEdges),
-            std::vector<NeighborEdge>{});
+            std::move(contEdgeIndices), std::move(lightEdgeOffsets),
+            std::move(lightEdgeIndices), std::move(neighborOffsets),
+            std::move(neighborVertexIds));
     }
 
     std::atomic<uint64_t> nextPathId{1};

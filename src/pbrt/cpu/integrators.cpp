@@ -538,7 +538,7 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
 
                 LightEdge lightEdge;
                 lightEdge.wi = ray.d;
-                lightEdge.L = light.Le(ray, lambda);
+                lightEdge.L_B = light.Le(ray, lambda);
                 lightEdge.ef = SampledSpectrum(1.f);
                 lightEdge.pdf = 1;
                 lightEdge.isDeltaLight = IsDeltaLight(light.Type());
@@ -554,7 +554,7 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
             L += beta * Le;
             LightEdge lightEdge;
             lightEdge.wi = -ray.d;
-            lightEdge.L = Le;
+            lightEdge.L_B = Le;
             lightEdge.ef = SampledSpectrum(1.f);
             lightEdge.pdf = 1;
             pathSink->AddLightEdge(lightEdge);
@@ -599,7 +599,7 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
 
                     LightEdge lightEdge;
                     lightEdge.wi = wi;
-                    lightEdge.L = ls->L;
+                    lightEdge.L_B = ls->L;
                     lightEdge.ef = SampledSpectrum(AbsDot(wi, isect.shading.n));
                     lightEdge.pdf = sampledLight->p * ls->pdf;
                     lightEdge.misWeight = 1;
