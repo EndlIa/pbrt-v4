@@ -537,7 +537,7 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
                 L += beta * light.Le(ray, lambda);
 
                 LightEdge lightEdge;
-                lightEdge.wi = ray.d;
+                lightEdge.wi = -ray.d;
                 lightEdge.L_B = light.Le(ray, lambda);
                 lightEdge.ef = SampledSpectrum(1.f);
                 lightEdge.pdf = 1;
@@ -572,15 +572,15 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
             continue;
         }
 
-        SurfaceVertex vertex;
-        vertex.depth = depth - 1;
-        vertex.pos = isect.p();
-        vertex.geometricNormal = isect.n;
-        vertex.shadingNormal = isect.shading.n;
-        vertex.wo = -ray.d;
-        vertex.materialId = isect.material ? int32_t(isect.material.Tag()) : -1;
-        vertex.bsdfFlags = bsdf.Flags();
-        pathSink->AddSurfaceVertex(vertex);
+        SurfaceVertex pathVertex;
+        pathVertex.depth = depth - 1;
+        pathVertex.pos = isect.p();
+        pathVertex.geometricNormal = isect.n;
+        pathVertex.shadingNormal = isect.shading.n;
+        pathVertex.wo = -ray.d;
+        pathVertex.materialId = isect.material ? int32_t(isect.material.Tag()) : -1;
+        pathVertex.bsdfFlags = bsdf.Flags();
+        pathSink->AddSurfaceVertex(pathVertex);
 
 
         pstd::optional<SampledLight> sampledLight = lightSampler.Sample(sampler.Get1D());
@@ -598,7 +598,7 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
                     L += beta * f * ls->L / (sampledLight->p * ls->pdf);
 
                     LightEdge lightEdge;
-                    lightEdge.wi = wi;
+                    lightEdge.wi = -wi;
                     lightEdge.L_B = ls->L;
                     lightEdge.ef = SampledSpectrum(AbsDot(wi, isect.shading.n));
                     lightEdge.pdf = sampledLight->p * ls->pdf;
@@ -663,7 +663,7 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
             
             ray = isect.SpawnRay(wi);
         }
-
+        pathVertex.L_in = L;
         CHECK_GE(beta.y(lambda), 0.f);
         DCHECK(!IsInf(beta.y(lambda)));
     }
