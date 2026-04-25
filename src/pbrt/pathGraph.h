@@ -120,8 +120,6 @@ class NoopPathGraphSink : public PathGraphSink {
     void EndPath(uint64_t) override {}
 };
 
-void ClusterPathGraph() {
-
-}
+void ClusterPathGraph();
 
 }  
