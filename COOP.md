@@ -32,6 +32,7 @@
 - ContEdgesIntoVertex 查询的是朝向该Vertex传递能量的边
 - (VertexID == 0)有保留语义，请从(VertexID == 1) 开始遍历
 
+
 ## 4. 暂未暴露的量
 - SurfaceVertex 的 clusterId, 感觉用不上
 

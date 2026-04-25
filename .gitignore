@@ -10,4 +10,5 @@ src/build
 assets/
 .codex
 image_eval/__pycache__/
-ADVICE.md
+XADVICE.md
+ENDLIA.md
