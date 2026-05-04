@@ -158,11 +158,7 @@ void RenderCPU(BasicScene &parsedScene) {
     }
 
     // Render!
-    BasicPathGraphBuilder pathGraphBuilder;
-    SetActivePathGraphBuilder(&pathGraphBuilder);
     integrator->Render();
-    SetActivePathGraphBuilder(nullptr);
-    ClusterPathGraph();
     LOG_VERBOSE("Memory used after rendering: %s", GetCurrentRSS());
 
     PtexTextureBase::ReportStats();

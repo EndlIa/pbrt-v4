@@ -42,8 +42,6 @@
 
 #include <algorithm>
 
-#include <pbrt/pathGraph.h>
-
 namespace pbrt {
 
 STAT_COUNTER("Integrator/Camera rays traced", nCameraRays);
@@ -517,17 +515,6 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
     SampledSpectrum L(0.f), beta(1.f);
     bool specularBounce = true;
     int depth = 0;
-    Float p_b = 0; /// pdf for BSDF
-    LightSampleContext prevIntrCtx;
-
-    PathGraphSink *pathSink = nullptr;
-    NoopPathGraphSink noopPathSink;
-    if (PathGraphBuilder *builder = GetActivePathGraphBuilder())
-        pathSink = builder->GetThreadLocalSink();
-    else
-        pathSink = &noopPathSink; ///ERROR case
-    pathSink->BeginPath(0);
-
     while (beta) {
         // Find next _TestOneIntegrator_ vertex and accumulate contribution
         // Intersect _ray_ with scene
@@ -535,51 +522,16 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
 
         // Account for infinite lights if ray has no intersection
         if (!si) {
-            for (const auto &light : infiniteLights) {
-                SampledSpectrum Le = light.Le(ray, lambda);
-                Float p_l = 0, edgePDF = 1, misWeight = 1;
-                if (sampleLights && !specularBounce) {
-                    p_l = lightSampler.PMF(prevIntrCtx, light) *
-                          light.PDF_Li(prevIntrCtx, ray.d, true);
-                    edgePDF = p_b;
-                    misWeight = PowerHeuristic(1, p_b, 1, p_l);
-                }
-                L += beta * misWeight * Le;
-
-                LightEdge lightEdge;
-                lightEdge.wi = -ray.d;
-                lightEdge.L_B = Le;
-                lightEdge.ef = SampledSpectrum(1.f);
-                lightEdge.pdf = edgePDF;
-                lightEdge.misWeight = misWeight;
-                lightEdge.isDeltaLight = IsDeltaLight(light.Type());
-                pathSink->AddLightEdge(lightEdge);
-            }
+            if (!sampleLights || specularBounce)
+                for (const auto &light : infiniteLights)
+                    L += beta * light.Le(ray, lambda);
             break;
         }
 
         // Account for emissive surface if light was not sampled
         SurfaceInteraction &isect = si->intr;
-        SampledSpectrum Le = isect.Le(-ray.d, lambda);
-        if (Le) {
-            Float p_l = 0, edgePDF = 1, misWeight = 1;
-            if (sampleLights && !specularBounce) {
-                Light areaLight(isect.areaLight);
-                p_l = lightSampler.PMF(prevIntrCtx, areaLight) *
-                      areaLight.PDF_Li(prevIntrCtx, ray.d, true);
-                edgePDF = p_b;
-                misWeight = PowerHeuristic(1, p_b, 1, p_l);
-            }
-            L += beta * misWeight * Le;
-
-            LightEdge lightEdge;
-            lightEdge.wi = -ray.d;
-            lightEdge.L_B = Le;
-            lightEdge.ef = SampledSpectrum(AbsDot(-ray.d, isect.shading.n));
-            lightEdge.pdf = edgePDF;
-            lightEdge.misWeight = misWeight;
-            pathSink->AddLightEdge(lightEdge);
-        }
+        if (!sampleLights || specularBounce)
+            L += beta * isect.Le(-ray.d, lambda);
 
         // End path if maximum depth reached
         if (depth++ == maxDepth)
@@ -593,54 +545,22 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
             continue;
         }
 
-        SurfaceVertex pathVertex;
-        pathVertex.depth = depth - 1;
-        pathVertex.pos = isect.p();
-        pathVertex.geometricNormal = isect.n;
-        pathVertex.shadingNormal = isect.shading.n;
-        pathVertex.wo = -ray.d;
-        pathVertex.materialId = isect.material ? int32_t(isect.material.Tag()) : -1;
-        pathVertex.bsdfFlags = bsdf.Flags();
-        pathSink->AddSurfaceVertex(pathVertex);
-
-
+        // Sample direct illumination if _sampleLights_ is true
+        Vector3f wo = -ray.d;
         if (sampleLights) {
-            LightSampleContext ctx(isect);
-            BxDFFlags flags = bsdf.Flags();
-            if (IsReflective(flags) && !IsTransmissive(flags))
-                ctx.pi = isect.OffsetRayOrigin(isect.wo);
-            else if (IsTransmissive(flags) && !IsReflective(flags))
-                ctx.pi = isect.OffsetRayOrigin(-isect.wo);
             pstd::optional<SampledLight> sampledLight =
-                lightSampler.Sample(ctx, sampler.Get1D());
+                lightSampler.Sample(sampler.Get1D());
             if (sampledLight) {
                 // Sample point on _sampledLight_ to estimate direct illumination
                 Point2f uLight = sampler.Get2D();
                 pstd::optional<LightLiSample> ls =
-                    sampledLight->light.SampleLi(ctx, uLight, lambda, true);
+                    sampledLight->light.SampleLi(isect, uLight, lambda);
                 if (ls && ls->L && ls->pdf > 0) {
                     // Evaluate BSDF for light and possibly add scattered radiance
                     Vector3f wi = ls->wi;
-                    Vector3f wo = -ray.d;
                     SampledSpectrum f = bsdf.f(wo, wi) * AbsDot(wi, isect.shading.n);
-                    if (f && Unoccluded(isect, ls->pLight)) {
-                        Float p_l = sampledLight->p * ls->pdf;
-                        Float misWeight = 1;
-                        if (!IsDeltaLight(sampledLight->light.Type())) {
-                            Float p_b_forLight = bsdf.PDF(wo, wi);
-                            misWeight = PowerHeuristic(1, p_l, 1, p_b_forLight);
-                        }
-                        L += beta * misWeight * f * ls->L / p_l;
-
-                        LightEdge lightEdge;
-                        lightEdge.wi = -wi;
-                        lightEdge.L_B = ls->L;
-                        lightEdge.ef = SampledSpectrum(AbsDot(wi, isect.shading.n));
-                        lightEdge.pdf = p_l;
-                        lightEdge.misWeight = misWeight;
-                        lightEdge.isDeltaLight = IsDeltaLight(sampledLight->light.Type());
-                        pathSink->AddLightEdge(lightEdge);
-                    }
+                    if (f && Unoccluded(isect, ls->pLight))
+                        L += beta * f * ls->L / (sampledLight->p * ls->pdf);
                 }
             }
         }
@@ -648,32 +568,18 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
         // Sample outgoing direction at intersection to continue path
         if (sampleBSDF) {
             // Sample BSDF for new path direction
-            Vector3f wo = -ray.d;
             Float u = sampler.Get1D();
             pstd::optional<BSDFSample> bs = bsdf.Sample_f(wo, u, sampler.Get2D());
             if (!bs)
                 break;
             beta *= bs->f * AbsDot(bs->wi, isect.shading.n) / bs->pdf;
-            p_b = bs->pdfIsProportional ? bsdf.PDF(wo, bs->wi) : bs->pdf;
             specularBounce = bs->IsSpecular();
-            prevIntrCtx = isect;
-
-            ContEdge contEdge;
-            contEdge.wi = -bs->wi;
-            contEdge.ef = bs->f * AbsDot(bs->wi, isect.shading.n);
-            contEdge.pdf = bs->pdf;
-            contEdge.rrQ = 0;
-            contEdge.flags = bs->flags;
-            contEdge.eta = bs->eta;
-            pathSink->AddContEdge(contEdge);
-
             ray = isect.SpawnRay(bs->wi);
 
         } else {
             // Uniformly sample sphere or hemisphere to get new path direction
             Float pdf;
             Vector3f wi;
-            Vector3f wo = -ray.d;
             BxDFFlags flags = bsdf.Flags();
             if (IsReflective(flags) && IsTransmissive(flags)) {
                 wi = SampleUniformSphere(sampler.Get2D());
@@ -686,27 +592,14 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
                 else if (IsTransmissive(flags) && Dot(wo, isect.n) * Dot(wi, isect.n) > 0)
                     wi = -wi;
             }
-
             beta *= bsdf.f(wo, wi) * AbsDot(wi, isect.shading.n) / pdf;
-            p_b = pdf;
             specularBounce = false;
-            prevIntrCtx = isect;
-
-            ContEdge contEdge;
-            contEdge.wi = -wi;
-            contEdge.ef = bsdf.f(wo, wi) * AbsDot(wi, isect.shading.n);
-            contEdge.pdf = pdf;
-            contEdge.rrQ = 0;
-            contEdge.flags = flags;
-            contEdge.eta = 1;
-            pathSink->AddContEdge(contEdge);
-            
             ray = isect.SpawnRay(wi);
         }
+
         CHECK_GE(beta.y(lambda), 0.f);
         DCHECK(!IsInf(beta.y(lambda)));
     }
-    pathSink->EndPath(0);
     return L;
 }
 
