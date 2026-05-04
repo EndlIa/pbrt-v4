@@ -577,6 +577,7 @@ set (PBRT_SOURCE_HEADERS
   src/pbrt/options.h
   src/pbrt/paramdict.h
   src/pbrt/parser.h
+  src/pbrt/pathGraph.h
   src/pbrt/pbrt.h
   src/pbrt/pbrt.soa
   src/pbrt/ray.h

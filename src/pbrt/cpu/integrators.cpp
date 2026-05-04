@@ -15,6 +15,7 @@
 #include <pbrt/media.h>
 #include <pbrt/options.h>
 #include <pbrt/paramdict.h>
+#include <pbrt/pathGraph.h>
 #include <pbrt/samplers.h>
 #include <pbrt/shapes.h>
 #include <pbrt/util/bluenoise.h>
@@ -507,6 +508,18 @@ TestOneIntegrator::TestOneIntegrator(int maxDepth, bool sampleLights, bool sampl
       sampleBSDF(sampleBSDF),
       lightSampler(lights, Allocator()) {}
 
+void TestOneIntegrator::Render() {
+    pathGraphBuilder.Reset();
+    ScopedPathGraphBuilder activeBuilder(&pathGraphBuilder);
+    RayIntegrator::Render();
+
+    std::unique_ptr<PathGraphSnapshot> snapshot = pathGraphBuilder.BuildSnapshot();
+    LOG_VERBOSE("TestOne path graph captured %zu vertices, %zu light edges, %zu continuation "
+                "edges, %zu clusters",
+                snapshot->Vertices().size(), snapshot->LightEdges().size(),
+                snapshot->ContEdges().size(), snapshot->Clusters().size());
+}
+
 SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &lambda,
                                       Sampler sampler,
                                       ScratchBuffer &scratchBuffer,
@@ -515,6 +528,20 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
     SampledSpectrum L(0.f), beta(1.f);
     bool specularBounce = true;
     int depth = 0;
+
+    NoopPathGraphSink noopPathSink;
+    PathGraphSink *pathSink = &noopPathSink;
+    if (PathGraphBuilder *builder = GetActivePathGraphBuilder())
+        pathSink = builder->GetThreadLocalSink();
+
+    struct PendingContEdge {
+        uint64_t vertexA = 0;
+        Vector3f wi;
+        Float pdf = 0;
+        BxDFFlags flags = BxDFFlags::Unset;
+    };
+    PendingContEdge pendingContEdge;
+
     while (beta) {
         // Find next _TestOneIntegrator_ vertex and accumulate contribution
         // Intersect _ray_ with scene
@@ -547,20 +574,64 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
 
         // Sample direct illumination if _sampleLights_ is true
         Vector3f wo = -ray.d;
+        SurfaceVertex vertex;
+        vertex.L_in = beta;
+        vertex.depth = depth - 1;
+        vertex.pos = isect.p();
+        vertex.geometricNormal = isect.n;
+        vertex.shadingNormal = isect.shading.n;
+        vertex.wo = wo;
+        vertex.bsdfFlags = bsdf.Flags();
+        uint64_t vertexId = pathSink->AddSurfaceVertex(vertex);
+
+        if (pendingContEdge.vertexA != 0) {
+            ContEdge edge;
+            edge.vertexA = pendingContEdge.vertexA;
+            edge.vertexB = vertexId;
+            edge.wi = pendingContEdge.wi;
+            edge.pdf = pendingContEdge.pdf;
+            edge.flags = pendingContEdge.flags;
+            pathSink->AddContEdge(edge);
+            pendingContEdge = {};
+        }
+
         if (sampleLights) {
+            LightSampleContext ctx(isect);
+            BxDFFlags flags = bsdf.Flags();
+            if (IsReflective(flags) && !IsTransmissive(flags))
+                ctx.pi = isect.OffsetRayOrigin(isect.wo);
+            else if (IsTransmissive(flags) && !IsReflective(flags))
+                ctx.pi = isect.OffsetRayOrigin(-isect.wo);
+
             pstd::optional<SampledLight> sampledLight =
-                lightSampler.Sample(sampler.Get1D());
+                lightSampler.Sample(ctx, sampler.Get1D());
             if (sampledLight) {
                 // Sample point on _sampledLight_ to estimate direct illumination
                 Point2f uLight = sampler.Get2D();
                 pstd::optional<LightLiSample> ls =
-                    sampledLight->light.SampleLi(isect, uLight, lambda);
+                    sampledLight->light.SampleLi(ctx, uLight, lambda, true);
                 if (ls && ls->L && ls->pdf > 0) {
                     // Evaluate BSDF for light and possibly add scattered radiance
                     Vector3f wi = ls->wi;
                     SampledSpectrum f = bsdf.f(wo, wi) * AbsDot(wi, isect.shading.n);
-                    if (f && Unoccluded(isect, ls->pLight))
-                        L += beta * f * ls->L / (sampledLight->p * ls->pdf);
+                    if (f && Unoccluded(isect, ls->pLight)) {
+                        Float p_l = sampledLight->p * ls->pdf;
+                        Float misWeight = 1;
+                        if (!IsDeltaLight(sampledLight->light.Type())) {
+                            Float p_b = bsdf.PDF(wo, wi);
+                            misWeight = PowerHeuristic(1, p_l, 1, p_b);
+                        }
+
+                        LightEdge edge;
+                        edge.vertexA = vertexId;
+                        edge.wi = wi;
+                        edge.L_B = ls->L;
+                        edge.pdf = p_l;
+                        edge.misWeight = misWeight;
+                        edge.isDeltaLight = IsDeltaLight(sampledLight->light.Type());
+                        pathSink->AddLightEdge(edge);
+                        L += beta * misWeight * f * ls->L / p_l;
+                    }
                 }
             }
         }
@@ -572,8 +643,10 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
             pstd::optional<BSDFSample> bs = bsdf.Sample_f(wo, u, sampler.Get2D());
             if (!bs)
                 break;
-            beta *= bs->f * AbsDot(bs->wi, isect.shading.n) / bs->pdf;
+            SampledSpectrum fcos = bs->f * AbsDot(bs->wi, isect.shading.n);
+            beta *= fcos / bs->pdf;
             specularBounce = bs->IsSpecular();
+            pendingContEdge = {vertexId, bs->wi, bs->pdf, bs->flags};
             ray = isect.SpawnRay(bs->wi);
 
         } else {
@@ -592,8 +665,10 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
                 else if (IsTransmissive(flags) && Dot(wo, isect.n) * Dot(wi, isect.n) > 0)
                     wi = -wi;
             }
-            beta *= bsdf.f(wo, wi) * AbsDot(wi, isect.shading.n) / pdf;
+            SampledSpectrum fcos = bsdf.f(wo, wi) * AbsDot(wi, isect.shading.n);
+            beta *= fcos / pdf;
             specularBounce = false;
+            pendingContEdge = {vertexId, wi, pdf, BxDFFlags::Unset};
             ray = isect.SpawnRay(wi);
         }
 

@@ -16,6 +16,7 @@
 #include <pbrt/interaction.h>
 #include <pbrt/lights.h>
 #include <pbrt/lightsamplers.h>
+#include <pbrt/pathGraph.h>
 #include <pbrt/util/lowdiscrepancy.h>
 #include <pbrt/util/print.h>
 #include <pbrt/util/pstd.h>
@@ -213,6 +214,7 @@ class TestOneIntegrator : public RayIntegrator {
     SampledSpectrum Li(RayDifferential ray, SampledWavelengths &lambda, Sampler sampler,
                        ScratchBuffer &scratchBuffer,
                        VisibleSurface *visibleSurface) const;
+    void Render();
 
     static std::unique_ptr<TestOneIntegrator> Create(
         const ParameterDictionary &parameters, Camera camera, Sampler sampler,
@@ -225,6 +227,7 @@ class TestOneIntegrator : public RayIntegrator {
     int maxDepth;
     bool sampleLights, sampleBSDF;
     UniformLightSampler lightSampler;
+    mutable PathGraphBuilder pathGraphBuilder;
 };
 
 // PathIntegrator Definition
