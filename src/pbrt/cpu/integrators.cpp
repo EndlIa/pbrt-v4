@@ -636,7 +636,12 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
         vertex.shadingNormal = isect.shading.n;
         vertex.wo = wo;
         vertex.bsdfFlags = bsdf.Flags();
-        vertex.bsdf = &bsdf;
+        if (ScratchBuffer *pathGraphBSDFScratch = pathSink->GetBSDFScratchBuffer()) {
+            BSDF pathGraphBSDF =
+                isect.GetBSDF(ray, lambda, camera, *pathGraphBSDFScratch, sampler);
+            if (pathGraphBSDF)
+                vertex.bsdf = &pathGraphBSDF;
+        }
         uint64_t vertexId = pathSink->AddSurfaceVertex(vertex);
 
         if (pendingContEdge.vertexA != 0) {
@@ -679,9 +684,11 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
 
                         LightEdge edge;
                         edge.vertexA = vertexId;
+                        edge.light = sampledLight->light;
                         edge.wi = wi;
                         edge.L_B = ls->L;
                         edge.pdf = p_l;
+                        edge.lightPMF = sampledLight->p;
                         edge.misWeight = misWeight;
                         edge.isDeltaLight = IsDeltaLight(sampledLight->light.Type());
                         pathSink->AddLightEdge(edge);

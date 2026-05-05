@@ -4,6 +4,8 @@
 
 #include <pbrt/bsdf.h>
 #include <pbrt/base/bxdf.h>
+#include <pbrt/lights.h>
+#include <pbrt/util/memory.h>
 #include <pbrt/util/pstd.h>
 #include <pbrt/util/spectrum.h>
 #include <pbrt/util/vecmath.h>
@@ -43,10 +45,12 @@ struct SurfaceVertex {
 
 struct LightEdge {
     uint64_t vertexA = 0;
+    Light light;
     Vector3f wi;
     SampledSpectrum L_B;  ///emit radiance
 
     Float pdf = 0;
+    Float lightPMF = 0;
     Float misWeight = 1;
 
     /// maybe useless ...
@@ -95,6 +99,7 @@ struct PathGraphThreadData {
     std::vector<LightEdge> lightEdges;
     std::vector<ContEdge> contEdges;
     std::vector<PixelVertexMapEntry> pixelVertexMap;
+    ScratchBuffer bsdfScratchBuffer;
     std::deque<BSDF> bsdfs;
     uint64_t lastSurfaceVertexId = 0;
     Point2i currentPixel;
@@ -121,6 +126,7 @@ class PathGraphSink {
                           const SampledWavelengths &lambda,
                           SampledSpectrum cameraWeight, Float filterWeight);
     void EndPixelSample();
+    ScratchBuffer *GetBSDFScratchBuffer();
     uint64_t LastSurfaceVertexId() const;
 
   private:

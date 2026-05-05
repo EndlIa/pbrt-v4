@@ -14,6 +14,36 @@ namespace {
 
 std::atomic<PathGraphBuilder *> activePathGraphBuilder{nullptr};
 
+LightSampleContext LightContext(const SurfaceVertex &vertex) {
+    return LightSampleContext(Point3fi(vertex.pos), vertex.geometricNormal,
+                              vertex.shadingNormal);
+}
+
+Float DirectMarginalDensity(const LightEdge &edge, const Cluster &cluster,
+                            pstd::span<const SurfaceVertex> vertices) {
+    if (!edge.light || edge.lightPMF <= 0)
+        return 0;
+
+    Float density = 0;
+    for (uint32_t vertexIndex : cluster.vertexIndices) {
+        const SurfaceVertex &vertex = vertices[vertexIndex];
+        density += edge.lightPMF * edge.light.PDF_Li(LightContext(vertex), edge.wi, true);
+    }
+    return density;
+}
+
+Float IndirectMarginalDensity(const ContEdge &edge, const Cluster &cluster,
+                              pstd::span<const SurfaceVertex> vertices) {
+    Float density = 0;
+    for (uint32_t vertexIndex : cluster.vertexIndices) {
+        const SurfaceVertex &vertex = vertices[vertexIndex];
+        if (!vertex.bsdf)
+            continue;
+        density += vertex.bsdf->PDF(vertex.wo, edge.wi);
+    }
+    return density;
+}
+
 }  // namespace
 
 void PathGraphThreadData::Clear() {
@@ -21,6 +51,7 @@ void PathGraphThreadData::Clear() {
     lightEdges.clear();
     contEdges.clear();
     pixelVertexMap.clear();
+    bsdfScratchBuffer.Reset();
     bsdfs.clear();
     lastSurfaceVertexId = 0;
     currentFirstVertexId = 0;
@@ -94,6 +125,10 @@ void PathGraphSink::EndPixelSample() {
 
     data->currentFirstVertexId = 0;
     data->hasCurrentPixelSample = false;
+}
+
+ScratchBuffer *PathGraphSink::GetBSDFScratchBuffer() {
+    return data ? &data->bsdfScratchBuffer : nullptr;
 }
 
 PathGraphSnapshot::PathGraphSnapshot(std::vector<SurfaceVertex> vertices,
@@ -186,10 +221,8 @@ void PathGraphSnapshot::AggregateDirectLighting(
     if (!fcosEvaluator)
         return;
 
+    pstd::span<const SurfaceVertex> vertexSpan(vertices);
     for (const Cluster &cluster : clusters) {
-        if (cluster.lightEdgePdfSum <= 0)
-            continue;
-
         for (uint32_t vertexIndex : cluster.vertexIndices) {
             SurfaceVertex &vertex = vertices[vertexIndex];
             SampledSpectrum Ld(0.f);
@@ -199,11 +232,15 @@ void PathGraphSnapshot::AggregateDirectLighting(
                 if (edge.pdf <= 0)
                     continue;
 
+                Float marginalDensity = DirectMarginalDensity(edge, cluster, vertexSpan);
+                if (marginalDensity <= 0)
+                    continue;
+
                 SampledSpectrum fcos = fcosEvaluator(vertex, edge);
                 if (!fcos)
                     continue;
 
-                Ld += fcos * edge.L_B * edge.misWeight / cluster.lightEdgePdfSum;
+                Ld += fcos * edge.L_B * edge.misWeight / marginalDensity;
             }
 
             vertex.L_direct = Ld;
@@ -235,9 +272,11 @@ void PathGraphSnapshot::AggregateIndirectLighting(
         edge.L_B = vertexB.L_direct + vertexB.L_indirect;
     }
 
+    pstd::span<const SurfaceVertex> vertexSpan(vertices);
     for (const Cluster &cluster : clusters) {
-        if (cluster.contEdgePdfSum <= 0)
-            continue;
+        Float inputEnergy = 0;
+        for (uint32_t edgeIndex : cluster.contEdgeIndices)
+            inputEnergy += contEdges[edgeIndex].L_B.Average();
 
         for (uint32_t vertexIndex : cluster.vertexIndices) {
             SurfaceVertex &vertex = vertices[vertexIndex];
@@ -248,14 +287,28 @@ void PathGraphSnapshot::AggregateIndirectLighting(
                 if (edge.pdf <= 0 || !edge.L_B)
                     continue;
 
+                Float marginalDensity = IndirectMarginalDensity(edge, cluster, vertexSpan);
+                if (marginalDensity <= 0)
+                    continue;
+
                 SampledSpectrum fcos = fcosEvaluator(vertex, edge);
                 if (!fcos)
                     continue;
 
-                Li += fcos * edge.L_B / cluster.contEdgePdfSum;
+                Li += fcos * edge.L_B / marginalDensity;
             }
 
             vertex.L_indirect = Li;
+        }
+
+        Float outputEnergy = 0;
+        for (uint32_t vertexIndex : cluster.vertexIndices)
+            outputEnergy += vertices[vertexIndex].L_indirect.Average();
+
+        if (inputEnergy > 0 && outputEnergy > inputEnergy) {
+            Float scale = (inputEnergy / outputEnergy) * 0.999f;
+            for (uint32_t vertexIndex : cluster.vertexIndices)
+                vertices[vertexIndex].L_indirect *= scale;
         }
     }
 }
@@ -273,29 +326,25 @@ void PathGraphSnapshot::FinalGather(
     for (uint32_t vertexIndex = 0; vertexIndex < vertices.size(); ++vertexIndex)
         vertexIdToIndex[vertices[vertexIndex].vertexId] = vertexIndex;
 
-    std::vector<Float> contPdfSums(vertices.size(), 0);
-
-    for (const ContEdge &edge : contEdges) {
-        auto iter = vertexIdToIndex.find(edge.vertexA);
-        if (iter != vertexIdToIndex.end())
-            contPdfSums[iter->second] += edge.pdf;
-    }
-
     for (const ContEdge &edge : contEdges) {
         auto iter = vertexIdToIndex.find(edge.vertexA);
         if (iter == vertexIdToIndex.end())
             continue;
 
         uint32_t vertexIndex = iter->second;
-        if (contPdfSums[vertexIndex] <= 0 || !edge.L_B)
+        if (!edge.L_B)
             continue;
 
         SurfaceVertex &vertex = vertices[vertexIndex];
+        Float marginalDensity = vertex.bsdf ? vertex.bsdf->PDF(vertex.wo, edge.wi) : 0;
+        if (marginalDensity <= 0)
+            continue;
+
         SampledSpectrum fcos = indirectFcosEvaluator(vertex, edge);
         if (!fcos)
             continue;
 
-        vertex.L_out += fcos * edge.L_B / contPdfSums[vertexIndex];
+        vertex.L_out += fcos * edge.L_B / marginalDensity;
     }
 }
 
