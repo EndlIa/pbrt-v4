@@ -523,6 +523,13 @@ void TestOneIntegrator::Render() {
     ScopedPathGraphBuilder activeBuilder(&pathGraphBuilder);
     RayIntegrator::Render();
 
+    if (pathGraphBuilder.WasTruncated()) {
+        LOG_ERROR("TestOne path graph capture exceeded the vertex budget; keeping the "
+                  "ordinary integrator image and skipping path graph post-processing.");
+        pathGraphBuilder.Reset();
+        return;
+    }
+
     std::unique_ptr<PathGraphSnapshot> snapshot = pathGraphBuilder.BuildSnapshot();
     auto directFcos = [](const SurfaceVertex &vertex,
                          const LightEdge &edge) -> SampledSpectrum {
@@ -540,25 +547,25 @@ void TestOneIntegrator::Render() {
     };
 
     snapshot->AggregateDirectLighting(directFcos);
-    for (int iter = 0; iter < maxDepth; ++iter)
+    int indirectIterations = std::min(maxDepth, 8);
+    for (int iter = 0; iter < indirectIterations; ++iter)
         snapshot->AggregateIndirectLighting(indirectFcos);
     snapshot->FinalGather(indirectFcos);
-
-    std::unordered_map<uint64_t, const SurfaceVertex *> vertexById;
-    vertexById.reserve(snapshot->Vertices().size());
-    for (const SurfaceVertex &vertex : snapshot->Vertices())
-        vertexById[vertex.vertexId] = &vertex;
 
     Film film = camera.GetFilm();
     for (Point2i pPixel : film.PixelBounds())
         film.ResetPixel(pPixel);
 
+    pstd::span<const SurfaceVertex> vertices = snapshot->Vertices();
     for (const PixelVertexMapEntry &entry : snapshot->PixelVertexMap()) {
-        auto iter = vertexById.find(entry.firstVertexId);
-        if (iter == vertexById.end())
+        if (entry.firstVertexId == 0 || entry.firstVertexId > vertices.size())
             continue;
 
-        SampledSpectrum L = entry.cameraWeight * iter->second->L_out;
+        const SurfaceVertex &vertex = vertices[entry.firstVertexId - 1];
+        if (vertex.vertexId != entry.firstVertexId)
+            continue;
+
+        SampledSpectrum L = entry.cameraWeight * vertex.L_out;
         film.AddSample(entry.pixel, L, entry.lambda, nullptr, entry.filterWeight);
     }
 
@@ -567,11 +574,18 @@ void TestOneIntegrator::Render() {
     metadata.samplesPerPixel = samplerPrototype.SamplesPerPixel();
     film.WriteImage(metadata, 1);
 
+    size_t vertexCount = snapshot->Vertices().size();
+    size_t lightEdgeCount = snapshot->LightEdges().size();
+    size_t contEdgeCount = snapshot->ContEdges().size();
+    size_t clusterCount = snapshot->Clusters().size();
+    size_t pixelVertexCount = snapshot->PixelVertexMap().size();
+    snapshot.reset();
+    pathGraphBuilder.Reset();
+
     LOG_VERBOSE("TestOne path graph captured %zu vertices, %zu light edges, %zu continuation "
-                "edges, %zu clusters, %zu pixel-to-vertex entries",
-                snapshot->Vertices().size(), snapshot->LightEdges().size(),
-                snapshot->ContEdges().size(), snapshot->Clusters().size(),
-                snapshot->PixelVertexMap().size());
+                "edges, %zu clusters, %zu pixel-to-vertex entries, %d indirect iterations",
+                vertexCount, lightEdgeCount, contEdgeCount, clusterCount, pixelVertexCount,
+                indirectIterations);
 }
 
 SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &lambda,
@@ -618,8 +632,12 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
         if (depth++ == maxDepth)
             break;
 
-        // Get BSDF and skip over medium boundaries
-        BSDF bsdf = isect.GetBSDF(ray, lambda, camera, scratchBuffer, sampler);
+        // Get BSDF and skip over medium boundaries. Allocate the BxDF in
+        // graph-owned scratch so saved BSDF pointers stay valid.
+        ScratchBuffer *pathGraphBSDFScratch = pathSink->GetBSDFScratchBuffer();
+        ScratchBuffer &bsdfScratch =
+            pathGraphBSDFScratch ? *pathGraphBSDFScratch : scratchBuffer;
+        BSDF bsdf = isect.GetBSDF(ray, lambda, camera, bsdfScratch, sampler);
         if (!bsdf) {
             specularBounce = true;
             isect.SkipIntersection(&ray, si->tHit);
@@ -636,12 +654,8 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
         vertex.shadingNormal = isect.shading.n;
         vertex.wo = wo;
         vertex.bsdfFlags = bsdf.Flags();
-        if (ScratchBuffer *pathGraphBSDFScratch = pathSink->GetBSDFScratchBuffer()) {
-            BSDF pathGraphBSDF =
-                isect.GetBSDF(ray, lambda, camera, *pathGraphBSDFScratch, sampler);
-            if (pathGraphBSDF)
-                vertex.bsdf = &pathGraphBSDF;
-        }
+        if (pathGraphBSDFScratch)
+            vertex.bsdf = &bsdf;
         uint64_t vertexId = pathSink->AddSurfaceVertex(vertex);
 
         if (pendingContEdge.vertexA != 0) {

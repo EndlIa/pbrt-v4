@@ -39,7 +39,7 @@ struct SurfaceVertex {
     /// detailed bxdf flags
     BxDFFlags bsdfFlags = BxDFFlags::Unset;
 
-    /// Optional BSDF pointer owned by the path graph snapshot.
+    /// Optional BSDF pointer owned by PathGraphThreadData until the graph solve ends.
     const BSDF *bsdf = nullptr;
 };
 
@@ -116,8 +116,13 @@ struct PathGraphThreadData {
 class PathGraphSink {
   public:
     explicit PathGraphSink(PathGraphThreadData *data = nullptr,
-                           std::atomic<uint64_t> *nextVertexId = nullptr)
-        : data(data), nextVertexId(nextVertexId) {}
+                           std::atomic<uint64_t> *nextVertexId = nullptr,
+                           uint64_t maxVertexCount = 0,
+                           std::atomic<bool> *truncated = nullptr)
+        : data(data),
+          nextVertexId(nextVertexId),
+          maxVertexCount(maxVertexCount),
+          truncated(truncated) {}
 
     uint64_t AddSurfaceVertex(SurfaceVertex vertex);
     void AddLightEdge(LightEdge edge);
@@ -132,6 +137,8 @@ class PathGraphSink {
   private:
     PathGraphThreadData *data = nullptr;
     std::atomic<uint64_t> *nextVertexId = nullptr;
+    uint64_t maxVertexCount = 0;
+    std::atomic<bool> *truncated = nullptr;
 };
 
 class NoopPathGraphSink : public PathGraphSink {
@@ -150,7 +157,6 @@ class PathGraphSnapshot {
                       std::vector<LightEdge> lightEdges,
                       std::vector<ContEdge> contEdges,
                       std::vector<PixelVertexMapEntry> pixelVertexMap,
-                      std::deque<BSDF> bsdfs,
                       uint32_t targetClusterSize = 16);
 
     pstd::span<const SurfaceVertex> Vertices() const { return vertices; }
@@ -169,13 +175,14 @@ class PathGraphSnapshot {
 
   private:
     void BuildClusters(uint32_t targetClusterSize);
+    uint32_t VertexIndexFromId(uint64_t vertexId) const;
 
     std::vector<SurfaceVertex> vertices;
     std::vector<LightEdge> lightEdges;
     std::vector<ContEdge> contEdges;
     std::vector<PixelVertexMapEntry> pixelVertexMap;
-    std::deque<BSDF> bsdfs;
     std::vector<Cluster> clusters;
+    std::vector<uint32_t> clusterByVertexIndex;
 };
 
 class PathGraphBuilder {
@@ -186,6 +193,7 @@ class PathGraphBuilder {
     PathGraphSink *GetThreadLocalSink();
     std::unique_ptr<PathGraphSnapshot> BuildSnapshot(uint32_t targetClusterSize = 16);
     void Reset();
+    bool WasTruncated() const;
 
   private:
     class Impl;
