@@ -47,6 +47,7 @@ struct LightEdge {
     uint64_t vertexA = 0;
     Light light;
     Vector3f wi;
+    Interaction pLight;
     SampledSpectrum L_B;  ///emit radiance
 
     Float pdf = 0;
@@ -176,6 +177,7 @@ class PathGraphSnapshot {
   private:
     void BuildClusters(uint32_t targetClusterSize);
     uint32_t VertexIndexFromId(uint64_t vertexId) const;
+    void BuildIndirectTransferWeights(const IndirectFcosEvaluator &fcosEvaluator);
 
     std::vector<SurfaceVertex> vertices;
     std::vector<LightEdge> lightEdges;
@@ -183,6 +185,8 @@ class PathGraphSnapshot {
     std::vector<PixelVertexMapEntry> pixelVertexMap;
     std::vector<Cluster> clusters;
     std::vector<uint32_t> clusterByVertexIndex;
+    std::vector<std::vector<SampledSpectrum>> indirectTransferWeights;
+    bool indirectTransferWeightsValid = false;
 };
 
 class PathGraphBuilder {

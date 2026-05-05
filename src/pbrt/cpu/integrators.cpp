@@ -700,6 +700,7 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
                         edge.vertexA = vertexId;
                         edge.light = sampledLight->light;
                         edge.wi = wi;
+                        edge.pLight = ls->pLight;
                         edge.L_B = ls->L;
                         edge.pdf = p_l;
                         edge.lightPMF = sampledLight->p;
