@@ -42,6 +42,7 @@
 #include <pbrt/util/string.h>
 
 #include <algorithm>
+#include <unordered_map>
 
 namespace pbrt {
 
@@ -257,8 +258,17 @@ void RayIntegrator::EvaluatePixelSample(Point2i pPixel, int sampleIndex, Sampler
         ++nCameraRays;
         // Evaluate radiance along camera ray
         bool initializeVisibleSurface = camera.GetFilm().UsesVisibleSurface();
+        PathGraphSink *pathGraphSink = nullptr;
+        if (PathGraphBuilder *pathGraphBuilder = GetActivePathGraphBuilder()) {
+            pathGraphSink = pathGraphBuilder->GetThreadLocalSink();
+            pathGraphSink->BeginPixelSample(pPixel, sampleIndex, lambda,
+                                            cameraRay->weight,
+                                            cameraSample.filterWeight);
+        }
         L = cameraRay->weight * Li(cameraRay->ray, lambda, sampler, scratchBuffer,
                                    initializeVisibleSurface ? &visibleSurface : nullptr);
+        if (pathGraphSink)
+            pathGraphSink->EndPixelSample();
 
         // Issue warning if unexpected radiance value is returned
         if (L.HasNaNs()) {
@@ -514,10 +524,54 @@ void TestOneIntegrator::Render() {
     RayIntegrator::Render();
 
     std::unique_ptr<PathGraphSnapshot> snapshot = pathGraphBuilder.BuildSnapshot();
+    auto directFcos = [](const SurfaceVertex &vertex,
+                         const LightEdge &edge) -> SampledSpectrum {
+        if (!vertex.bsdf)
+            return SampledSpectrum(0.f);
+        return vertex.bsdf->f(vertex.wo, edge.wi) *
+               AbsDot(edge.wi, vertex.shadingNormal);
+    };
+    auto indirectFcos = [](const SurfaceVertex &vertex,
+                           const ContEdge &edge) -> SampledSpectrum {
+        if (!vertex.bsdf)
+            return SampledSpectrum(0.f);
+        return vertex.bsdf->f(vertex.wo, edge.wi) *
+               AbsDot(edge.wi, vertex.shadingNormal);
+    };
+
+    snapshot->AggregateDirectLighting(directFcos);
+    for (int iter = 0; iter < maxDepth; ++iter)
+        snapshot->AggregateIndirectLighting(indirectFcos);
+    snapshot->FinalGather(indirectFcos);
+
+    std::unordered_map<uint64_t, const SurfaceVertex *> vertexById;
+    vertexById.reserve(snapshot->Vertices().size());
+    for (const SurfaceVertex &vertex : snapshot->Vertices())
+        vertexById[vertex.vertexId] = &vertex;
+
+    Film film = camera.GetFilm();
+    for (Point2i pPixel : film.PixelBounds())
+        film.ResetPixel(pPixel);
+
+    for (const PixelVertexMapEntry &entry : snapshot->PixelVertexMap()) {
+        auto iter = vertexById.find(entry.firstVertexId);
+        if (iter == vertexById.end())
+            continue;
+
+        SampledSpectrum L = entry.cameraWeight * iter->second->L_out;
+        film.AddSample(entry.pixel, L, entry.lambda, nullptr, entry.filterWeight);
+    }
+
+    ImageMetadata metadata;
+    camera.InitMetadata(&metadata);
+    metadata.samplesPerPixel = samplerPrototype.SamplesPerPixel();
+    film.WriteImage(metadata, 1);
+
     LOG_VERBOSE("TestOne path graph captured %zu vertices, %zu light edges, %zu continuation "
-                "edges, %zu clusters",
+                "edges, %zu clusters, %zu pixel-to-vertex entries",
                 snapshot->Vertices().size(), snapshot->LightEdges().size(),
-                snapshot->ContEdges().size(), snapshot->Clusters().size());
+                snapshot->ContEdges().size(), snapshot->Clusters().size(),
+                snapshot->PixelVertexMap().size());
 }
 
 SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &lambda,
@@ -582,6 +636,7 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
         vertex.shadingNormal = isect.shading.n;
         vertex.wo = wo;
         vertex.bsdfFlags = bsdf.Flags();
+        vertex.bsdf = &bsdf;
         uint64_t vertexId = pathSink->AddSurfaceVertex(vertex);
 
         if (pendingContEdge.vertexA != 0) {
