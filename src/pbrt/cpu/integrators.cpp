@@ -597,7 +597,7 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
     bool specularBounce = true;
     int depth = 0;
 
-    NoopPathGraphSink noopPathSink;
+    PathGraphSink noopPathSink;
     PathGraphSink *pathSink = &noopPathSink;
     if (PathGraphBuilder *builder = GetActivePathGraphBuilder())
         pathSink = builder->GetThreadLocalSink();
@@ -647,7 +647,6 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
         // Sample direct illumination if _sampleLights_ is true
         Vector3f wo = -ray.d;
         SurfaceVertex vertex;
-        vertex.L_in = beta;
         vertex.depth = depth - 1;
         vertex.pos = isect.p();
         vertex.geometricNormal = isect.n;

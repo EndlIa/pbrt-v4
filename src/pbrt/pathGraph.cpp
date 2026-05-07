@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <deque>
 #include <limits>
 #include <utility>
 
@@ -21,6 +22,29 @@ constexpr uint64_t kEstimatedBytesPerCapturedVertex =
     sizeof(LightEdge) / 4 + sizeof(PixelVertexMapEntry) / 4;
 constexpr uint64_t kMaxCapturedVertices =
     kPathGraphCaptureBudgetBytes / kEstimatedBytesPerCapturedVertex;
+
+}  // namespace
+
+struct PathGraphThreadData {
+    std::vector<SurfaceVertex> vertices;
+    std::vector<LightEdge> lightEdges;
+    std::vector<ContEdge> contEdges;
+    std::vector<PixelVertexMapEntry> pixelVertexMap;
+    ScratchBuffer bsdfScratchBuffer;
+    std::deque<BSDF> bsdfs;
+    uint64_t lastSurfaceVertexId = 0;
+    Point2i currentPixel;
+    int currentSampleIndex = 0;
+    SampledWavelengths currentLambda;
+    SampledSpectrum currentCameraWeight = SampledSpectrum(1.f);
+    Float currentFilterWeight = 1;
+    uint64_t currentFirstVertexId = 0;
+    bool hasCurrentPixelSample = false;
+
+    void Clear();
+};
+
+namespace {
 
 LightSampleContext LightContext(const SurfaceVertex &vertex) {
     return LightSampleContext(Point3fi(vertex.pos), vertex.geometricNormal,
@@ -187,10 +211,6 @@ void PathGraphSink::AddContEdge(ContEdge edge) {
     data->contEdges.push_back(edge);
 }
 
-uint64_t PathGraphSink::LastSurfaceVertexId() const {
-    return data ? data->lastSurfaceVertexId : 0;
-}
-
 void PathGraphSink::BeginPixelSample(Point2i pixel, int sampleIndex,
                                      const SampledWavelengths &lambda,
                                      SampledSpectrum cameraWeight, Float filterWeight) {
@@ -238,6 +258,7 @@ PathGraphSnapshot::PathGraphSnapshot(std::vector<SurfaceVertex> vertices,
 void PathGraphSnapshot::BuildClusters(uint32_t targetClusterSize) {
     clusters.clear();
     clusterByVertexIndex.clear();
+    contEdgeTargetVertexIndices.clear();
     if (vertices.empty())
         return;
 
@@ -288,16 +309,11 @@ void PathGraphSnapshot::BuildClusters(uint32_t targetClusterSize) {
         if (begin >= end)
             break;
 
-        const SurfaceVertex &centerVertex = vertices[sortedVertexIndices[begin]];
         Cluster &cluster = clusters[clusterId];
         cluster.clusterId = clusterId;
-        cluster.centerVertexId = centerVertex.vertexId;
-        cluster.center = centerVertex.pos;
 
         for (uint32_t i = begin; i < end; ++i) {
             uint32_t vertexIndex = sortedVertexIndices[i];
-            const SurfaceVertex &vertex = vertices[vertexIndex];
-            cluster.vertexIds.push_back(vertex.vertexId);
             cluster.vertexIndices.push_back(vertexIndex);
             clusterByVertexIndex[vertexIndex] = clusterId;
         }
@@ -309,7 +325,6 @@ void PathGraphSnapshot::BuildClusters(uint32_t targetClusterSize) {
             continue;
         Cluster &cluster = clusters[clusterByVertexIndex[vertexIndex]];
         cluster.lightEdgeIndices.push_back(edgeIndex);
-        cluster.lightEdgePdfSum += lightEdges[edgeIndex].pdf;
     }
 
     for (uint32_t edgeIndex = 0; edgeIndex < contEdges.size(); ++edgeIndex) {
@@ -318,8 +333,11 @@ void PathGraphSnapshot::BuildClusters(uint32_t targetClusterSize) {
             continue;
         Cluster &cluster = clusters[clusterByVertexIndex[vertexIndex]];
         cluster.contEdgeIndices.push_back(edgeIndex);
-        cluster.contEdgePdfSum += contEdges[edgeIndex].pdf;
     }
+
+    contEdgeTargetVertexIndices.resize(contEdges.size(), uint32_t(-1));
+    for (uint32_t edgeIndex = 0; edgeIndex < contEdges.size(); ++edgeIndex)
+        contEdgeTargetVertexIndices[edgeIndex] = VertexIndexFromId(contEdges[edgeIndex].vertexB);
 }
 
 uint32_t PathGraphSnapshot::VertexIndexFromId(uint64_t vertexId) const {
@@ -426,7 +444,7 @@ void PathGraphSnapshot::BuildIndirectTransferWeights(
 
 void PathGraphSnapshot::AggregateIndirectLighting(
     const IndirectFcosEvaluator &fcosEvaluator) {
-    std::vector<SampledSpectrum> previousIndirect(vertices.size(), SampledSpectrum(0.f));
+    previousIndirect.resize(vertices.size());
     for (uint32_t vertexIndex = 0; vertexIndex < vertices.size(); ++vertexIndex)
         previousIndirect[vertexIndex] = vertices[vertexIndex].L_indirect;
 
@@ -439,8 +457,9 @@ void PathGraphSnapshot::AggregateIndirectLighting(
     if (!indirectTransferWeightsValid)
         BuildIndirectTransferWeights(fcosEvaluator);
 
-    for (ContEdge &edge : contEdges) {
-        uint32_t vertexIndex = VertexIndexFromId(edge.vertexB);
+    for (uint32_t edgeIndex = 0; edgeIndex < contEdges.size(); ++edgeIndex) {
+        ContEdge &edge = contEdges[edgeIndex];
+        uint32_t vertexIndex = contEdgeTargetVertexIndices[edgeIndex];
         if (vertexIndex == uint32_t(-1)) {
             edge.L_B = SampledSpectrum(0.f);
             continue;

@@ -14,15 +14,15 @@
 #include <atomic>
 #include <memory>
 #include <functional>
-#include <deque>
 #include <vector>
 
 
 namespace pbrt {
 
+struct PathGraphThreadData;
+
 struct SurfaceVertex {
     uint64_t vertexId = 0;
-    SampledSpectrum L_in = SampledSpectrum(0.f);
     SampledSpectrum L_out = SampledSpectrum(0.f);
     SampledSpectrum L_direct = SampledSpectrum(0.f);
     SampledSpectrum L_indirect = SampledSpectrum(0.f);
@@ -32,9 +32,6 @@ struct SurfaceVertex {
     Normal3f geometricNormal;
     Normal3f shadingNormal;
     Vector3f wo;
-
-    /// use type index to avoid storing raw BSDF pointers.
-    int32_t materialId = -1;
 
     /// detailed bxdf flags
     BxDFFlags bsdfFlags = BxDFFlags::Unset;
@@ -68,22 +65,15 @@ struct ContEdge {
     
     /// maybe useless ...
     BxDFFlags flags = BxDFFlags::Unset;
-    Float eta = 1;  // relative refractive index
 };
 
 struct Cluster {
     uint32_t clusterId = 0;
-    uint64_t centerVertexId = 0;
-    Point3f center;
 
-    std::vector<uint64_t> vertexIds;
     std::vector<uint32_t> vertexIndices;
 
     std::vector<uint32_t> lightEdgeIndices;
     std::vector<uint32_t> contEdgeIndices;
-
-    Float lightEdgePdfSum = 0;
-    Float contEdgePdfSum = 0;
 };
 
 struct PixelVertexMapEntry {
@@ -93,25 +83,6 @@ struct PixelVertexMapEntry {
     SampledWavelengths lambda;
     SampledSpectrum cameraWeight = SampledSpectrum(1.f);
     Float filterWeight = 1;
-};
-
-struct PathGraphThreadData {
-    std::vector<SurfaceVertex> vertices;
-    std::vector<LightEdge> lightEdges;
-    std::vector<ContEdge> contEdges;
-    std::vector<PixelVertexMapEntry> pixelVertexMap;
-    ScratchBuffer bsdfScratchBuffer;
-    std::deque<BSDF> bsdfs;
-    uint64_t lastSurfaceVertexId = 0;
-    Point2i currentPixel;
-    int currentSampleIndex = 0;
-    SampledWavelengths currentLambda;
-    SampledSpectrum currentCameraWeight = SampledSpectrum(1.f);
-    Float currentFilterWeight = 1;
-    uint64_t currentFirstVertexId = 0;
-    bool hasCurrentPixelSample = false;
-
-    void Clear();
 };
 
 class PathGraphSink {
@@ -133,18 +104,12 @@ class PathGraphSink {
                           SampledSpectrum cameraWeight, Float filterWeight);
     void EndPixelSample();
     ScratchBuffer *GetBSDFScratchBuffer();
-    uint64_t LastSurfaceVertexId() const;
 
   private:
     PathGraphThreadData *data = nullptr;
     std::atomic<uint64_t> *nextVertexId = nullptr;
     uint64_t maxVertexCount = 0;
     std::atomic<bool> *truncated = nullptr;
-};
-
-class NoopPathGraphSink : public PathGraphSink {
-  public:
-    NoopPathGraphSink() : PathGraphSink(nullptr, nullptr) {}
 };
 
 class PathGraphSnapshot {
@@ -161,10 +126,8 @@ class PathGraphSnapshot {
                       uint32_t targetClusterSize = 16);
 
     pstd::span<const SurfaceVertex> Vertices() const { return vertices; }
-    pstd::span<SurfaceVertex> MutableVertices() { return vertices; }
     pstd::span<const LightEdge> LightEdges() const { return lightEdges; }
     pstd::span<const ContEdge> ContEdges() const { return contEdges; }
-    pstd::span<ContEdge> MutableContEdges() { return contEdges; }
     pstd::span<const Cluster> Clusters() const { return clusters; }
     pstd::span<const PixelVertexMapEntry> PixelVertexMap() const {
         return pixelVertexMap;
@@ -185,7 +148,9 @@ class PathGraphSnapshot {
     std::vector<PixelVertexMapEntry> pixelVertexMap;
     std::vector<Cluster> clusters;
     std::vector<uint32_t> clusterByVertexIndex;
+    std::vector<uint32_t> contEdgeTargetVertexIndices;
     std::vector<std::vector<SampledSpectrum>> indirectTransferWeights;
+    std::vector<SampledSpectrum> previousIndirect;
     bool indirectTransferWeightsValid = false;
 };
 
