@@ -72,12 +72,6 @@ Vector3f LightDirectionForVertex(const LightEdge &edge, const SurfaceVertex &ver
     return edge.wi;
 }
 
-LightEdge LightEdgeForVertex(const LightEdge &edge, const SurfaceVertex &vertex) {
-    LightEdge adjusted = edge;
-    adjusted.wi = LightDirectionForVertex(edge, vertex);
-    return adjusted;
-}
-
 Vector3f ContinuationDirectionForVertex(const ContEdge &edge,
                                         const SurfaceVertex &vertex,
                                         pstd::span<const SurfaceVertex> vertices) {
@@ -98,18 +92,22 @@ ContEdge ContEdgeForVertex(const ContEdge &edge, const SurfaceVertex &vertex,
 }
 
 Float DirectMarginalDensity(const LightEdge &edge, const Cluster &cluster,
-                            pstd::span<const SurfaceVertex> vertices) {
+                            pstd::span<const SurfaceVertex> vertices,
+                            pstd::span<Vector3f> cachedDirections,
+                            uint32_t edgeOffset, uint32_t nEdges) {
     if (!edge.light || edge.lightPMF <= 0)
         return 0;
 
     Float density = 0;
-    for (uint32_t vertexIndex : cluster.vertexIndices) {
-        const SurfaceVertex &vertex = vertices[vertexIndex];
+    for (uint32_t vertexOffset = 0; vertexOffset < cluster.vertexIndices.size();
+         ++vertexOffset) {
+        const SurfaceVertex &vertex = vertices[cluster.vertexIndices[vertexOffset]];
+        Vector3f wi = LightDirectionForVertex(edge, vertex);
+        cachedDirections[vertexOffset * nEdges + edgeOffset] = wi;
         if (edge.isDeltaLight) {
             density += edge.lightPMF;
             continue;
         }
-        Vector3f wi = LightDirectionForVertex(edge, vertex);
         density += edge.lightPMF * edge.light.PDF_Li(OffsetLightContext(vertex), wi, true);
     }
     return density;
@@ -358,30 +356,37 @@ void PathGraphSnapshot::AggregateDirectLighting(
         return;
 
     pstd::span<const SurfaceVertex> vertexSpan(vertices);
-    for (const Cluster &cluster : clusters) {
-        std::vector<Float> marginalDensities(cluster.lightEdgeIndices.size(), 0);
-        for (uint32_t i = 0; i < cluster.lightEdgeIndices.size(); ++i) {
-            const LightEdge &edge = lightEdges[cluster.lightEdgeIndices[i]];
+    ParallelFor(0, clusters.size(), [&](int64_t clusterIndex) {
+        const Cluster &cluster = clusters[clusterIndex];
+        uint32_t nVertices = cluster.vertexIndices.size();
+        uint32_t nEdges = cluster.lightEdgeIndices.size();
+        std::vector<Vector3f> lightDirections(nVertices * nEdges);
+        std::vector<Float> marginalDensities(nEdges, 0);
+        for (uint32_t edgeOffset = 0; edgeOffset < nEdges; ++edgeOffset) {
+            const LightEdge &edge = lightEdges[cluster.lightEdgeIndices[edgeOffset]];
             if (edge.pdf > 0)
-                marginalDensities[i] = DirectMarginalDensity(edge, cluster, vertexSpan);
+                marginalDensities[edgeOffset] =
+                    DirectMarginalDensity(edge, cluster, vertexSpan, lightDirections,
+                                          edgeOffset, nEdges);
         }
 
-        for (uint32_t vertexIndex : cluster.vertexIndices) {
+        for (uint32_t vertexOffset = 0; vertexOffset < nVertices; ++vertexOffset) {
+            uint32_t vertexIndex = cluster.vertexIndices[vertexOffset];
             SurfaceVertex &vertex = vertices[vertexIndex];
             SampledSpectrum Ld(0.f);
 
-            for (uint32_t i = 0; i < cluster.lightEdgeIndices.size(); ++i) {
-                uint32_t edgeIndex = cluster.lightEdgeIndices[i];
+            for (uint32_t edgeOffset = 0; edgeOffset < nEdges; ++edgeOffset) {
+                uint32_t edgeIndex = cluster.lightEdgeIndices[edgeOffset];
                 const LightEdge &edge = lightEdges[edgeIndex];
                 if (edge.pdf <= 0)
                     continue;
 
-                Float marginalDensity = marginalDensities[i];
+                Float marginalDensity = marginalDensities[edgeOffset];
                 if (marginalDensity <= 0)
                     continue;
 
-                LightEdge adjustedEdge = LightEdgeForVertex(edge, vertex);
-                SampledSpectrum fcos = fcosEvaluator(vertex, adjustedEdge);
+                Vector3f wi = lightDirections[vertexOffset * nEdges + edgeOffset];
+                SampledSpectrum fcos = fcosEvaluator(vertex, wi);
                 if (!fcos)
                     continue;
 
@@ -390,7 +395,7 @@ void PathGraphSnapshot::AggregateDirectLighting(
 
             vertex.L_direct = Ld;
         }
-    }
+    });
 }
 
 void PathGraphSnapshot::BuildIndirectTransferWeights(
@@ -403,14 +408,14 @@ void PathGraphSnapshot::BuildIndirectTransferWeights(
     }
 
     pstd::span<const SurfaceVertex> vertexSpan(vertices);
-    for (uint32_t clusterIndex = 0; clusterIndex < clusters.size(); ++clusterIndex) {
+    ParallelFor(0, clusters.size(), [&](int64_t clusterIndex) {
         const Cluster &cluster = clusters[clusterIndex];
         size_t nVertices = cluster.vertexIndices.size();
         size_t nEdges = cluster.contEdgeIndices.size();
         std::vector<SampledSpectrum> &weights = indirectTransferWeights[clusterIndex];
         weights.assign(nVertices * nEdges, SampledSpectrum(0.f));
         if (nVertices == 0 || nEdges == 0)
-            continue;
+            return;
 
         std::vector<Float> marginalDensities(nEdges, 0);
         for (uint32_t edgeOffset = 0; edgeOffset < nEdges; ++edgeOffset) {
@@ -437,7 +442,7 @@ void PathGraphSnapshot::BuildIndirectTransferWeights(
                 weights[vertexOffset * nEdges + edgeOffset] = fcos / marginalDensity;
             }
         }
-    }
+    });
 
     indirectTransferWeightsValid = true;
 }
@@ -445,11 +450,11 @@ void PathGraphSnapshot::BuildIndirectTransferWeights(
 void PathGraphSnapshot::AggregateIndirectLighting(
     const IndirectFcosEvaluator &fcosEvaluator) {
     previousIndirect.resize(vertices.size());
-    for (uint32_t vertexIndex = 0; vertexIndex < vertices.size(); ++vertexIndex)
+    ParallelFor(0, vertices.size(), [&](int64_t vertexIndex) {
         previousIndirect[vertexIndex] = vertices[vertexIndex].L_indirect;
+        vertices[vertexIndex].L_indirect = SampledSpectrum(0.f);
+    });
 
-    for (SurfaceVertex &vertex : vertices)
-        vertex.L_indirect = SampledSpectrum(0.f);
 
     if (!fcosEvaluator)
         return;
@@ -457,19 +462,19 @@ void PathGraphSnapshot::AggregateIndirectLighting(
     if (!indirectTransferWeightsValid)
         BuildIndirectTransferWeights(fcosEvaluator);
 
-    for (uint32_t edgeIndex = 0; edgeIndex < contEdges.size(); ++edgeIndex) {
+    ParallelFor(0, contEdges.size(), [&](int64_t edgeIndex) {
         ContEdge &edge = contEdges[edgeIndex];
         uint32_t vertexIndex = contEdgeTargetVertexIndices[edgeIndex];
         if (vertexIndex == uint32_t(-1)) {
             edge.L_B = SampledSpectrum(0.f);
-            continue;
+            return;
         }
 
         const SurfaceVertex &vertexB = vertices[vertexIndex];
         edge.L_B = vertexB.L_direct + previousIndirect[vertexIndex];
-    }
+    });
 
-    for (uint32_t clusterIndex = 0; clusterIndex < clusters.size(); ++clusterIndex) {
+    ParallelFor(0, clusters.size(), [&](int64_t clusterIndex) {
         const Cluster &cluster = clusters[clusterIndex];
         const std::vector<SampledSpectrum> &weights =
             indirectTransferWeights[clusterIndex];
@@ -510,7 +515,7 @@ void PathGraphSnapshot::AggregateIndirectLighting(
             for (uint32_t vertexIndex : cluster.vertexIndices)
                 vertices[vertexIndex].L_indirect *= scale;
         }
-    }
+    });
 }
 
 void PathGraphSnapshot::FinalGather(

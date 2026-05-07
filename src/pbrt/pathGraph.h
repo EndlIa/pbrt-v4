@@ -115,7 +115,7 @@ class PathGraphSink {
 class PathGraphSnapshot {
   public:
     using DirectFcosEvaluator =
-        std::function<SampledSpectrum(const SurfaceVertex &, const LightEdge &)>;
+        std::function<SampledSpectrum(const SurfaceVertex &, Vector3f wi)>;
     using IndirectFcosEvaluator =
         std::function<SampledSpectrum(const SurfaceVertex &, const ContEdge &)>;
 

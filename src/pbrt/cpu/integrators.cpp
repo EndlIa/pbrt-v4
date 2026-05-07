@@ -531,12 +531,10 @@ void TestOneIntegrator::Render() {
     }
 
     std::unique_ptr<PathGraphSnapshot> snapshot = pathGraphBuilder.BuildSnapshot();
-    auto directFcos = [](const SurfaceVertex &vertex,
-                         const LightEdge &edge) -> SampledSpectrum {
+    auto directFcos = [](const SurfaceVertex &vertex, Vector3f wi) -> SampledSpectrum {
         if (!vertex.bsdf)
             return SampledSpectrum(0.f);
-        return vertex.bsdf->f(vertex.wo, edge.wi) *
-               AbsDot(edge.wi, vertex.shadingNormal);
+        return vertex.bsdf->f(vertex.wo, wi) * AbsDot(wi, vertex.shadingNormal);
     };
     auto indirectFcos = [](const SurfaceVertex &vertex,
                            const ContEdge &edge) -> SampledSpectrum {
