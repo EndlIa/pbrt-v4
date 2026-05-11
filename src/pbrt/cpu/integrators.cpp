@@ -540,6 +540,12 @@ void TestOneIntegrator::Render() {
             return SampledSpectrum(0.f);
         return vertex.bsdf->f(vertex.wo, wi);
     };
+    auto directVisible = [this](const SurfaceVertex &vertex,
+                                const Interaction &pLight) -> bool {
+        Interaction pVertex(Point3fi(vertex.pos), vertex.geometricNormal, {},
+                            vertex.wo, vertex.time);
+        return Unoccluded(pVertex, pLight);
+    };
     auto indirectFcos = [](const SurfaceVertex &vertex,
                            const ContEdge &edge) -> SampledSpectrum {
         if (!vertex.bsdf)
@@ -548,7 +554,7 @@ void TestOneIntegrator::Render() {
                AbsDot(edge.wi, vertex.shadingNormal);
     };
 
-    snapshot->AggregateDirectLighting(directBSDF);
+    snapshot->AggregateDirectLighting(directBSDF, directVisible);
     int indirectIterations = std::min(maxDepth, 8);
     for (int iter = 0; iter < indirectIterations; ++iter)
         snapshot->AggregateIndirectLighting(indirectFcos);
@@ -659,6 +665,7 @@ void TestOneIntegrator::CaptureLightPaths(int nLightPaths) const {
 
             SurfaceVertex vertex;
             vertex.depth = depth;
+            vertex.time = isect.time;
             vertex.pos = isect.p();
             vertex.geometricNormal = isect.n;
             vertex.shadingNormal = isect.shading.n;
@@ -678,7 +685,10 @@ void TestOneIntegrator::CaptureLightPaths(int nLightPaths) const {
                 // Emission-ray density: p(light) * p(dA on light) *
                 // p(dω from light). Direct aggregation accounts for the
                 // light-side cosine and uses a unit surface kernel for now.
-                edge.pdf = sampledLight->p * les->pdfPos * les->pdfDir;
+                edge.lightPMF = sampledLight->p;
+                edge.pdfPos = les->pdfPos;
+                edge.pdfDir = les->pdfDir;
+                edge.pdf = edge.lightPMF * edge.pdfPos * edge.pdfDir;
                 edge.misWeight = 1;
                 edge.isDeltaLight = IsDeltaLight(light.Type());
                 pathSink->AddLightEdge(edge);
@@ -764,6 +774,7 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
         Vector3f wo = -ray.d;
         SurfaceVertex vertex;
         vertex.depth = depth - 1;
+        vertex.time = isect.time;
         vertex.pos = isect.p();
         vertex.geometricNormal = isect.n;
         vertex.shadingNormal = isect.shading.n;

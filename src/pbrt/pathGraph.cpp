@@ -91,20 +91,42 @@ ContEdge ContEdgeForVertex(const ContEdge &edge, const SurfaceVertex &vertex,
     return adjusted;
 }
 
-Float DirectMarginalDensity(const LightEdge &edge, const Cluster &cluster,
-                            pstd::span<const SurfaceVertex> vertices,
-                            pstd::span<Vector3f> cachedDirections,
-                            uint32_t edgeOffset, uint32_t nEdges) {
-    if (edge.pdf <= 0)
+Float DirectEmissionRayDensity(const LightEdge &edge, Vector3f wi) {
+    if (edge.lightPMF <= 0 || edge.pdfPos <= 0)
         return 0;
 
+    Float pdfPos = edge.pdfPos;
+    Float pdfDir = edge.pdfDir;
+    if (edge.light && edge.light.Type() == LightType::Area)
+        edge.light.PDF_Le(edge.pLight, -wi, &pdfPos, &pdfDir);
+    else
+        return edge.pdf;
+
+    return edge.lightPMF * pdfPos * pdfDir;
+}
+
+Float CacheDirectLightDirectionsAndMarginalDensity(
+    const LightEdge &edge, const Cluster &cluster,
+    pstd::span<const SurfaceVertex> vertices, pstd::span<Vector3f> cachedDirections,
+    uint32_t edgeOffset, uint32_t nEdges,
+    const PathGraphSnapshot::DirectVisibilityTester &visibilityTester) {
+    Float density = 0;
     for (uint32_t vertexOffset = 0; vertexOffset < cluster.vertexIndices.size();
          ++vertexOffset) {
         const SurfaceVertex &vertex = vertices[cluster.vertexIndices[vertexOffset]];
         Vector3f wi = LightDirectionForVertex(edge, vertex);
         cachedDirections[vertexOffset * nEdges + edgeOffset] = wi;
+
+        // The marginal density sums only techniques that can actually realize this
+        // reused light segment for the cluster endpoint. A light ray aimed at an
+        // occluded vertex cannot generate that endpoint, so it should not increase
+        // the denominator for this edge's cluster-level MIS density.
+        if (!visibilityTester(vertex, edge.pLight))
+            continue;
+
+        density += DirectEmissionRayDensity(edge, wi);
     }
-    return edge.pdf;
+    return density;
 }
 
 Float DirectKernelValue(const Cluster &, const LightEdge &, const SurfaceVertex &) {
@@ -348,11 +370,12 @@ uint32_t PathGraphSnapshot::VertexIndexFromId(uint64_t vertexId) const {
 }
 
 void PathGraphSnapshot::AggregateDirectLighting(
-    const DirectBSDFEvaluator &bsdfEvaluator) {
+    const DirectBSDFEvaluator &bsdfEvaluator,
+    const DirectVisibilityTester &visibilityTester) {
     for (SurfaceVertex &vertex : vertices)
         vertex.L_direct = SampledSpectrum(0.f);
 
-    if (!bsdfEvaluator)
+    if (!bsdfEvaluator || !visibilityTester)
         return;
 
     pstd::span<const SurfaceVertex> vertexSpan(vertices);
@@ -366,8 +389,9 @@ void PathGraphSnapshot::AggregateDirectLighting(
             const LightEdge &edge = lightEdges[cluster.lightEdgeIndices[edgeOffset]];
             if (edge.pdf > 0)
                 marginalDensities[edgeOffset] =
-                    DirectMarginalDensity(edge, cluster, vertexSpan, lightDirections,
-                                          edgeOffset, nEdges);
+                    CacheDirectLightDirectionsAndMarginalDensity(
+                        edge, cluster, vertexSpan, lightDirections, edgeOffset, nEdges,
+                        visibilityTester);
         }
 
         for (uint32_t vertexOffset = 0; vertexOffset < nVertices; ++vertexOffset) {
@@ -386,6 +410,9 @@ void PathGraphSnapshot::AggregateDirectLighting(
                     continue;
 
                 Vector3f wi = lightDirections[vertexOffset * nEdges + edgeOffset];
+                if (!visibilityTester(vertex, edge.pLight))
+                    continue;
+
                 Float cosLight = AbsDot(edge.pLight.n, -wi);
                 if (cosLight <= 0)
                     continue;

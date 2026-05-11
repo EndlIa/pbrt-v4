@@ -27,6 +27,7 @@ struct SurfaceVertex {
     SampledSpectrum L_direct = SampledSpectrum(0.f);
     SampledSpectrum L_indirect = SampledSpectrum(0.f);
     uint32_t depth = 0;
+    Float time = 0;
 
     Point3f pos;
     Normal3f geometricNormal;
@@ -51,6 +52,9 @@ struct LightEdge {
     // p(light) * p(position on light) * p(direction from light), i.e. dA_light dω_light.
     // It is not an NEE solid-angle PDF at vertexA and not an area-area segment PDF.
     Float pdf = 0;
+    Float lightPMF = 0;
+    Float pdfPos = 0;
+    Float pdfDir = 0;
     Float misWeight = 1;
 
     /// maybe useless ...
@@ -118,6 +122,8 @@ class PathGraphSnapshot {
   public:
     using DirectBSDFEvaluator =
         std::function<SampledSpectrum(const SurfaceVertex &, Vector3f wi)>;
+    using DirectVisibilityTester =
+        std::function<bool(const SurfaceVertex &, const Interaction &)>;
     using IndirectFcosEvaluator =
         std::function<SampledSpectrum(const SurfaceVertex &, const ContEdge &)>;
 
@@ -135,7 +141,8 @@ class PathGraphSnapshot {
         return pixelVertexMap;
     }
 
-    void AggregateDirectLighting(const DirectBSDFEvaluator &bsdfEvaluator);
+    void AggregateDirectLighting(const DirectBSDFEvaluator &bsdfEvaluator,
+                                 const DirectVisibilityTester &visibilityTester);
     void AggregateIndirectLighting(const IndirectFcosEvaluator &fcosEvaluator);
     void FinalGather(const IndirectFcosEvaluator &indirectFcosEvaluator);
 
