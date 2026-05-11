@@ -48,7 +48,6 @@ struct LightEdge {
     SampledSpectrum L_B;  ///emit radiance
 
     Float pdf = 0;
-    Float lightPMF = 0;
     Float misWeight = 1;
 
     /// maybe useless ...

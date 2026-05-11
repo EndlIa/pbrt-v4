@@ -509,12 +509,11 @@ std::unique_ptr<SimplePathIntegrator> SimplePathIntegrator::Create(
 }
 
 // TestOneIntegrator Method Definitions
-TestOneIntegrator::TestOneIntegrator(int maxDepth, bool sampleLights, bool sampleBSDF,
+TestOneIntegrator::TestOneIntegrator(int maxDepth, bool sampleBSDF,
                                      Camera camera, Sampler sampler,
                                      Primitive aggregate, std::vector<Light> lights)
     : RayIntegrator(camera, sampler, aggregate, lights),
       maxDepth(maxDepth),
-      sampleLights(sampleLights),
       sampleBSDF(sampleBSDF),
       lightSampler(lights, Allocator()) {}
 
@@ -522,6 +521,11 @@ void TestOneIntegrator::Render() {
     pathGraphBuilder.Reset();
     ScopedPathGraphBuilder activeBuilder(&pathGraphBuilder);
     RayIntegrator::Render();
+
+    Bounds2i pixelBounds = camera.GetFilm().PixelBounds();
+    int spp = samplerPrototype.SamplesPerPixel();
+    int nLightPaths = std::max<int>(1, std::ceil(0.25f * pixelBounds.Area() * spp));
+    CaptureLightPaths(nLightPaths);
 
     if (pathGraphBuilder.WasTruncated()) {
         LOG_ERROR("TestOne path graph capture exceeded the vertex budget; keeping the "
@@ -586,13 +590,128 @@ void TestOneIntegrator::Render() {
                 indirectIterations);
 }
 
+void TestOneIntegrator::CaptureLightPaths(int nLightPaths) const {
+    if (nLightPaths <= 0 || lights.empty())
+        return;
+
+    Bounds2i pixelBounds = camera.GetFilm().PixelBounds();
+    Vector2i extent = pixelBounds.Diagonal();
+    ThreadLocal<Sampler> samplers(
+        [this]() { return const_cast<Sampler &>(samplerPrototype).Clone(); });
+    ThreadLocal<ScratchBuffer> scratchBuffers([]() { return ScratchBuffer(); });
+
+    ParallelFor(0, nLightPaths, [&](int64_t pathIndex) {
+        Sampler sampler = samplers.Get();
+        ScratchBuffer &scratchBuffer = scratchBuffers.Get();
+
+        Point2i pPixel(pixelBounds.pMin.x + (pathIndex % extent.x),
+                       pixelBounds.pMin.y + ((pathIndex / extent.x) % extent.y));
+        int sampleIndex = pathIndex / std::max(1, pixelBounds.Area());
+        sampler.StartPixelSample(pPixel, sampleIndex);
+
+        Float lu = sampler.Get1D();
+        if (Options->disableWavelengthJitter)
+            lu = 0.5f;
+        SampledWavelengths lambda = camera.GetFilm().SampleWavelengths(lu);
+
+        pstd::optional<SampledLight> sampledLight = lightSampler.Sample(sampler.Get1D());
+        if (!sampledLight)
+            return;
+
+        Light light = sampledLight->light;
+        Float time = camera.SampleTime(sampler.Get1D());
+        pstd::optional<LightLeSample> les =
+            light.SampleLe(sampler.Get2D(), sampler.Get2D(), lambda, time);
+        if (!les || !les->L || les->pdfPos <= 0 || les->pdfDir <= 0)
+            return;
+
+        // TODO: Infinite and delta light emission segments are skipped in this
+        // prototype; they do not provide the surface interaction needed by the
+        // current light-start segment representation.
+        if (!les->intr)
+            return;
+
+        PathGraphSink noopPathSink;
+        PathGraphSink *pathSink = &noopPathSink;
+        if (PathGraphBuilder *builder = GetActivePathGraphBuilder())
+            pathSink = builder->GetThreadLocalSink();
+
+        RayDifferential ray(les->ray);
+        uint64_t previousVertexId = 0;
+        Float previousPdf = 0;
+        BxDFFlags previousFlags = BxDFFlags::Unset;
+        bool firstSurface = true;
+
+        for (int depth = 0; depth < maxDepth; ++depth) {
+            pstd::optional<ShapeIntersection> si = Intersect(ray);
+            if (!si)
+                break;
+
+            SurfaceInteraction &isect = si->intr;
+            ScratchBuffer *pathGraphBSDFScratch = pathSink->GetBSDFScratchBuffer();
+            ScratchBuffer &bsdfScratch =
+                pathGraphBSDFScratch ? *pathGraphBSDFScratch : scratchBuffer;
+            BSDF bsdf = isect.GetBSDF(ray, lambda, camera, bsdfScratch, sampler);
+            if (!bsdf) {
+                isect.SkipIntersection(&ray, si->tHit);
+                continue;
+            }
+
+            SurfaceVertex vertex;
+            vertex.depth = depth;
+            vertex.pos = isect.p();
+            vertex.geometricNormal = isect.n;
+            vertex.shadingNormal = isect.shading.n;
+            vertex.wo = -ray.d;
+            vertex.bsdfFlags = bsdf.Flags();
+            if (pathGraphBSDFScratch)
+                vertex.bsdf = &bsdf;
+            uint64_t vertexId = pathSink->AddSurfaceVertex(vertex);
+
+            if (firstSurface) {
+                LightEdge edge;
+                edge.vertexA = vertexId;
+                edge.light = light;
+                edge.pLight = *les->intr;
+                edge.wi = Normalize(edge.pLight.p() - vertex.pos);
+                edge.L_B = les->L;
+                edge.pdf = sampledLight->p * les->pdfPos * les->pdfDir;
+                edge.misWeight = 1;
+                edge.isDeltaLight = IsDeltaLight(light.Type());
+                pathSink->AddLightEdge(edge);
+                firstSurface = false;
+            } else if (previousVertexId != 0) {
+                ContEdge edge;
+                edge.vertexA = vertexId;
+                edge.vertexB = previousVertexId;
+                edge.wi = -ray.d;
+                edge.pdf = previousPdf;
+                edge.flags = previousFlags;
+                pathSink->AddContEdge(edge);
+            }
+
+            previousVertexId = vertexId;
+
+            pstd::optional<BSDFSample> bs =
+                bsdf.Sample_f(vertex.wo, sampler.Get1D(), sampler.Get2D(),
+                              TransportMode::Importance);
+            if (!bs || bs->pdf <= 0)
+                break;
+
+            ray = isect.SpawnRay(ray, bsdf, bs->wi, bs->flags, bs->eta);
+            previousPdf = bs->pdf;
+            previousFlags = bs->flags;
+            scratchBuffer.Reset();
+        }
+    });
+}
+
 SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &lambda,
                                       Sampler sampler,
                                       ScratchBuffer &scratchBuffer,
                                       VisibleSurface *) const {
     // Estimate radiance along ray using simple path tracing
     SampledSpectrum L(0.f), beta(1.f);
-    bool specularBounce = true;
     int depth = 0;
 
     PathGraphSink noopPathSink;
@@ -615,16 +734,14 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
 
         // Account for infinite lights if ray has no intersection
         if (!si) {
-            if (!sampleLights || specularBounce)
-                for (const auto &light : infiniteLights)
-                    L += beta * light.Le(ray, lambda);
+            for (const auto &light : infiniteLights)
+                L += beta * light.Le(ray, lambda);
             break;
         }
 
-        // Account for emissive surface if light was not sampled
+        // Account for emissive surface hit by the camera path
         SurfaceInteraction &isect = si->intr;
-        if (!sampleLights || specularBounce)
-            L += beta * isect.Le(-ray.d, lambda);
+        L += beta * isect.Le(-ray.d, lambda);
 
         // End path if maximum depth reached
         if (depth++ == maxDepth)
@@ -637,12 +754,10 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
             pathGraphBSDFScratch ? *pathGraphBSDFScratch : scratchBuffer;
         BSDF bsdf = isect.GetBSDF(ray, lambda, camera, bsdfScratch, sampler);
         if (!bsdf) {
-            specularBounce = true;
             isect.SkipIntersection(&ray, si->tHit);
             continue;
         }
 
-        // Sample direct illumination if _sampleLights_ is true
         Vector3f wo = -ray.d;
         SurfaceVertex vertex;
         vertex.depth = depth - 1;
@@ -666,50 +781,6 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
             pendingContEdge = {};
         }
 
-        if (sampleLights) {
-            LightSampleContext ctx(isect);
-            BxDFFlags flags = bsdf.Flags();
-            if (IsReflective(flags) && !IsTransmissive(flags))
-                ctx.pi = isect.OffsetRayOrigin(isect.wo);
-            else if (IsTransmissive(flags) && !IsReflective(flags))
-                ctx.pi = isect.OffsetRayOrigin(-isect.wo);
-
-            pstd::optional<SampledLight> sampledLight =
-                lightSampler.Sample(ctx, sampler.Get1D());
-            if (sampledLight) {
-                // Sample point on _sampledLight_ to estimate direct illumination
-                Point2f uLight = sampler.Get2D();
-                pstd::optional<LightLiSample> ls =
-                    sampledLight->light.SampleLi(ctx, uLight, lambda, true);
-                if (ls && ls->L && ls->pdf > 0) {
-                    // Evaluate BSDF for light and possibly add scattered radiance
-                    Vector3f wi = ls->wi;
-                    SampledSpectrum f = bsdf.f(wo, wi) * AbsDot(wi, isect.shading.n);
-                    if (f && Unoccluded(isect, ls->pLight)) {
-                        Float p_l = sampledLight->p * ls->pdf;
-                        Float misWeight = 1;
-                        if (!IsDeltaLight(sampledLight->light.Type())) {
-                            Float p_b = bsdf.PDF(wo, wi);
-                            misWeight = PowerHeuristic(1, p_l, 1, p_b);
-                        }
-
-                        LightEdge edge;
-                        edge.vertexA = vertexId;
-                        edge.light = sampledLight->light;
-                        edge.wi = wi;
-                        edge.pLight = ls->pLight;
-                        edge.L_B = ls->L;
-                        edge.pdf = p_l;
-                        edge.lightPMF = sampledLight->p;
-                        edge.misWeight = misWeight;
-                        edge.isDeltaLight = IsDeltaLight(sampledLight->light.Type());
-                        pathSink->AddLightEdge(edge);
-                        L += beta * misWeight * f * ls->L / p_l;
-                    }
-                }
-            }
-        }
-
         // Sample outgoing direction at intersection to continue path
         if (sampleBSDF) {
             // Sample BSDF for new path direction
@@ -719,7 +790,6 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
                 break;
             SampledSpectrum fcos = bs->f * AbsDot(bs->wi, isect.shading.n);
             beta *= fcos / bs->pdf;
-            specularBounce = bs->IsSpecular();
             pendingContEdge = {vertexId, bs->wi, bs->pdf, bs->flags};
             ray = isect.SpawnRay(bs->wi);
 
@@ -741,7 +811,6 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
             }
             SampledSpectrum fcos = bsdf.f(wo, wi) * AbsDot(wi, isect.shading.n);
             beta *= fcos / pdf;
-            specularBounce = false;
             pendingContEdge = {vertexId, wi, pdf, BxDFFlags::Unset};
             ray = isect.SpawnRay(wi);
         }
@@ -753,19 +822,17 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
 }
 
 std::string TestOneIntegrator::ToString() const {
-    return StringPrintf("[ TestOneIntegrator maxDepth: %d sampleLights: %s "
-                        "sampleBSDF: %s ]",
-                        maxDepth, sampleLights, sampleBSDF);
+    return StringPrintf("[ TestOneIntegrator maxDepth: %d sampleBSDF: %s ]",
+                        maxDepth, sampleBSDF);
 }
 
 std::unique_ptr<TestOneIntegrator> TestOneIntegrator::Create(
     const ParameterDictionary &parameters, Camera camera, Sampler sampler,
     Primitive aggregate, std::vector<Light> lights, const FileLoc *loc) {
     int maxDepth = parameters.GetOneInt("maxdepth", 5);
-    bool sampleLights = parameters.GetOneBool("samplelights", true);
     bool sampleBSDF = parameters.GetOneBool("samplebsdf", true);
-    return std::make_unique<TestOneIntegrator>(maxDepth, sampleLights, sampleBSDF,
-                                               camera, sampler, aggregate, lights);
+    return std::make_unique<TestOneIntegrator>(maxDepth, sampleBSDF, camera, sampler,
+                                               aggregate, lights);
 }
 
 // LightPathIntegrator Method Definitions

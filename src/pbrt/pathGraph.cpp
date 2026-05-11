@@ -95,22 +95,16 @@ Float DirectMarginalDensity(const LightEdge &edge, const Cluster &cluster,
                             pstd::span<const SurfaceVertex> vertices,
                             pstd::span<Vector3f> cachedDirections,
                             uint32_t edgeOffset, uint32_t nEdges) {
-    if (!edge.light || edge.lightPMF <= 0)
+    if (edge.pdf <= 0)
         return 0;
 
-    Float density = 0;
     for (uint32_t vertexOffset = 0; vertexOffset < cluster.vertexIndices.size();
          ++vertexOffset) {
         const SurfaceVertex &vertex = vertices[cluster.vertexIndices[vertexOffset]];
         Vector3f wi = LightDirectionForVertex(edge, vertex);
         cachedDirections[vertexOffset * nEdges + edgeOffset] = wi;
-        if (edge.isDeltaLight) {
-            density += edge.lightPMF;
-            continue;
-        }
-        density += edge.lightPMF * edge.light.PDF_Li(OffsetLightContext(vertex), wi, true);
     }
-    return density;
+    return edge.pdf;
 }
 
 Float IndirectMarginalDensity(const ContEdge &edge, const Cluster &cluster,
