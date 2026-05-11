@@ -107,6 +107,12 @@ Float DirectMarginalDensity(const LightEdge &edge, const Cluster &cluster,
     return edge.pdf;
 }
 
+Float DirectKernelValue(const Cluster &, const LightEdge &, const SurfaceVertex &) {
+    // TODO(SLTS): replace this with the normalized surface kernel 1 / supportArea
+    // once clustering owns voxel/normal support and progressive shrinking.
+    return 1;
+}
+
 Float IndirectMarginalDensity(const ContEdge &edge, const Cluster &cluster,
                               pstd::span<const SurfaceVertex> vertices) {
     Float density = 0;
@@ -342,11 +348,11 @@ uint32_t PathGraphSnapshot::VertexIndexFromId(uint64_t vertexId) const {
 }
 
 void PathGraphSnapshot::AggregateDirectLighting(
-    const DirectFcosEvaluator &fcosEvaluator) {
+    const DirectBSDFEvaluator &bsdfEvaluator) {
     for (SurfaceVertex &vertex : vertices)
         vertex.L_direct = SampledSpectrum(0.f);
 
-    if (!fcosEvaluator)
+    if (!bsdfEvaluator)
         return;
 
     pstd::span<const SurfaceVertex> vertexSpan(vertices);
@@ -380,11 +386,17 @@ void PathGraphSnapshot::AggregateDirectLighting(
                     continue;
 
                 Vector3f wi = lightDirections[vertexOffset * nEdges + edgeOffset];
-                SampledSpectrum fcos = fcosEvaluator(vertex, wi);
-                if (!fcos)
+                Float cosLight = AbsDot(edge.pLight.n, -wi);
+                if (cosLight <= 0)
                     continue;
 
-                Ld += fcos * edge.L_B * edge.misWeight / marginalDensity;
+                SampledSpectrum f = bsdfEvaluator(vertex, wi);
+                if (!f)
+                    continue;
+
+                Float kernel = DirectKernelValue(cluster, edge, vertex);
+                Ld += kernel * f * edge.L_B * cosLight * edge.misWeight /
+                      marginalDensity;
             }
 
             vertex.L_direct = Ld;

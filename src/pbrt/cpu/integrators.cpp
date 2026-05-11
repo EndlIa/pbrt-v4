@@ -535,10 +535,10 @@ void TestOneIntegrator::Render() {
     }
 
     std::unique_ptr<PathGraphSnapshot> snapshot = pathGraphBuilder.BuildSnapshot();
-    auto directFcos = [](const SurfaceVertex &vertex, Vector3f wi) -> SampledSpectrum {
+    auto directBSDF = [](const SurfaceVertex &vertex, Vector3f wi) -> SampledSpectrum {
         if (!vertex.bsdf)
             return SampledSpectrum(0.f);
-        return vertex.bsdf->f(vertex.wo, wi) * AbsDot(wi, vertex.shadingNormal);
+        return vertex.bsdf->f(vertex.wo, wi);
     };
     auto indirectFcos = [](const SurfaceVertex &vertex,
                            const ContEdge &edge) -> SampledSpectrum {
@@ -548,7 +548,7 @@ void TestOneIntegrator::Render() {
                AbsDot(edge.wi, vertex.shadingNormal);
     };
 
-    snapshot->AggregateDirectLighting(directFcos);
+    snapshot->AggregateDirectLighting(directBSDF);
     int indirectIterations = std::min(maxDepth, 8);
     for (int iter = 0; iter < indirectIterations; ++iter)
         snapshot->AggregateIndirectLighting(indirectFcos);
@@ -675,6 +675,9 @@ void TestOneIntegrator::CaptureLightPaths(int nLightPaths) const {
                 edge.pLight = *les->intr;
                 edge.wi = Normalize(edge.pLight.p() - vertex.pos);
                 edge.L_B = les->L;
+                // Emission-ray density: p(light) * p(dA on light) *
+                // p(dω from light). Direct aggregation accounts for the
+                // light-side cosine and uses a unit surface kernel for now.
                 edge.pdf = sampledLight->p * les->pdfPos * les->pdfDir;
                 edge.misWeight = 1;
                 edge.isDeltaLight = IsDeltaLight(light.Type());

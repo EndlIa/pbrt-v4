@@ -45,8 +45,11 @@ struct LightEdge {
     Light light;
     Vector3f wi;
     Interaction pLight;
-    SampledSpectrum L_B;  ///emit radiance
+    SampledSpectrum L_B;  /// Emitted radiance along the sampled light ray.
 
+    // PDF for sampling this light-start segment in the emission-ray measure:
+    // p(light) * p(position on light) * p(direction from light), i.e. dA_light dω_light.
+    // It is not an NEE solid-angle PDF at vertexA and not an area-area segment PDF.
     Float pdf = 0;
     Float misWeight = 1;
 
@@ -113,7 +116,7 @@ class PathGraphSink {
 
 class PathGraphSnapshot {
   public:
-    using DirectFcosEvaluator =
+    using DirectBSDFEvaluator =
         std::function<SampledSpectrum(const SurfaceVertex &, Vector3f wi)>;
     using IndirectFcosEvaluator =
         std::function<SampledSpectrum(const SurfaceVertex &, const ContEdge &)>;
@@ -132,7 +135,7 @@ class PathGraphSnapshot {
         return pixelVertexMap;
     }
 
-    void AggregateDirectLighting(const DirectFcosEvaluator &fcosEvaluator);
+    void AggregateDirectLighting(const DirectBSDFEvaluator &bsdfEvaluator);
     void AggregateIndirectLighting(const IndirectFcosEvaluator &fcosEvaluator);
     void FinalGather(const IndirectFcosEvaluator &indirectFcosEvaluator);
 
