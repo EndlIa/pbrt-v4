@@ -102,6 +102,9 @@ Float DirectEmissionRayDensity(const LightEdge &edge, Vector3f wi) {
     else
         return edge.pdf;
 
+    if (pdfPos <= 0 || pdfDir <= 0)
+        return 0;
+
     return edge.lightPMF * pdfPos * pdfDir;
 }
 
@@ -135,21 +138,93 @@ Float DirectKernelValue(const Cluster &, const LightEdge &, const SurfaceVertex 
     return 1;
 }
 
-Float IndirectMarginalDensity(const ContEdge &edge, const Cluster &cluster,
-                              pstd::span<const SurfaceVertex> vertices) {
+Float SegmentAreaJacobian(const SurfaceVertex &source, const SurfaceVertex &target,
+                          Vector3f wi) {
+    Float distanceSquared = DistanceSquared(source.pos, target.pos);
+    if (distanceSquared <= 0)
+        return 0;
+
+    // Convert a directional density at source to an area density at target:
+    // dω_source = |n_target . (-wi)| / |target-source|^2 dA_target.
+    //
+    // This uses the geometric normal because it is a change of measure, not a
+    // scattering term. Shading normals still belong in fcosEvaluator().
+    Float targetCos = AbsDot(target.geometricNormal, -wi);
+    if (targetCos <= 0)
+        return 0;
+    return targetCos / distanceSquared;
+}
+
+Float ContinuationEndpointDensity(const ContEdge &edge,
+                                  const SurfaceVertex &sourceVertex,
+                                  const SurfaceVertex &targetVertex,
+                                  bool sourceIsOriginalEndpointA) {
+    if (DistanceSquared(sourceVertex.pos, targetVertex.pos) <= 0)
+        return 0;
+    Vector3f wi = Normalize(targetVertex.pos - sourceVertex.pos);
+
+    Float pdfOmega = 0;
+    if (IsSpecular(edge.flags)) {
+        // For delta chains the only reliable density is the one recorded when
+        // that exact endpoint sampled the edge. Reusing a delta lobe from a
+        // neighboring vertex is undefined until SLTS has explicit delta support.
+        if (sourceIsOriginalEndpointA && sourceVertex.vertexId == edge.vertexA)
+            pdfOmega = edge.pdfForward;
+        else if (!sourceIsOriginalEndpointA && sourceVertex.vertexId == edge.vertexB)
+            pdfOmega = edge.pdfReverse;
+    } else if (sourceVertex.bsdf) {
+        pdfOmega = sourceVertex.bsdf->PDF(sourceVertex.wo, wi);
+    }
+
+    if (pdfOmega <= 0)
+        return 0;
+    return pdfOmega * SegmentAreaJacobian(sourceVertex, targetVertex, wi);
+}
+
+Float IndirectKernelValue(const Cluster &, const ContEdge &, const SurfaceVertex &) {
+    // TODO(SLTS): replace this unit kernel with the normalized two-end segment
+    // kernel. The current area-density denominator below is arranged so that,
+    // with only the forward endpoint density present, multiplying the numerator
+    // by the same area Jacobian reduces exactly to the old f*cos / p_omega
+    // Deng-style continuation weight.
+    return 1;
+}
+
+Float IndirectMarginalSegmentDensity(const ContEdge &edge, const Cluster &sourceCluster,
+                                     const Cluster *targetCluster,
+                                     pstd::span<const SurfaceVertex> vertices) {
+    uint32_t vertexAIndex =
+        edge.vertexA == 0 ? uint32_t(-1) : uint32_t(edge.vertexA - 1);
+    uint32_t vertexBIndex =
+        edge.vertexB == 0 ? uint32_t(-1) : uint32_t(edge.vertexB - 1);
+    if (vertexAIndex >= vertices.size() || vertexBIndex >= vertices.size() ||
+        vertices[vertexAIndex].vertexId != edge.vertexA ||
+        vertices[vertexBIndex].vertexId != edge.vertexB)
+        return 0;
+
+    const SurfaceVertex &endpointA = vertices[vertexAIndex];
+    const SurfaceVertex &endpointB = vertices[vertexBIndex];
     Float density = 0;
-    for (uint32_t vertexIndex : cluster.vertexIndices) {
+    for (uint32_t vertexIndex : sourceCluster.vertexIndices) {
         const SurfaceVertex &vertex = vertices[vertexIndex];
-        if (!vertex.bsdf)
-            continue;
-        Vector3f wi = ContinuationDirectionForVertex(edge, vertex, vertices);
-        if (IsSpecular(edge.flags)) {
-            if (vertex.vertexId == edge.vertexA)
-                density += edge.pdf;
-        } else {
-            density += vertex.bsdf->PDF(vertex.wo, wi);
+        density += ContinuationEndpointDensity(edge, vertex, endpointB,
+                                               true /* sourceIsOriginalEndpointA */);
+    }
+
+    // SLTS two-ended MMIS: also account for techniques that could have generated
+    // the same segment from the opposite endpoint cluster. This is a transitional
+    // segment-measure denominator: both sides are converted from solid angle to
+    // endpoint area density. The remaining missing piece is the normalized
+    // two-end kernel support, which will make these endpoint densities part of a
+    // full dA_A dA_B segment density instead of the current local proxy.
+    if (targetCluster) {
+        for (uint32_t vertexIndex : targetCluster->vertexIndices) {
+            const SurfaceVertex &vertex = vertices[vertexIndex];
+            density += ContinuationEndpointDensity(edge, vertex, endpointA,
+                                                   false /* sourceIsOriginalEndpointA */);
         }
     }
+
     return density;
 }
 
@@ -413,7 +488,7 @@ void PathGraphSnapshot::AggregateDirectLighting(
                 if (!visibilityTester(vertex, edge.pLight))
                     continue;
 
-                Float cosLight = AbsDot(edge.pLight.n, -wi);
+                Float cosLight = Dot(edge.pLight.n, -wi);
                 if (cosLight <= 0)
                     continue;
 
@@ -452,10 +527,17 @@ void PathGraphSnapshot::BuildIndirectTransferWeights(
 
         std::vector<Float> marginalDensities(nEdges, 0);
         for (uint32_t edgeOffset = 0; edgeOffset < nEdges; ++edgeOffset) {
-            const ContEdge &edge = contEdges[cluster.contEdgeIndices[edgeOffset]];
-            if (edge.pdf > 0)
+            uint32_t edgeIndex = cluster.contEdgeIndices[edgeOffset];
+            const ContEdge &edge = contEdges[edgeIndex];
+            if (edge.pdfForward > 0) {
+                const Cluster *targetCluster = nullptr;
+                uint32_t targetVertexIndex = contEdgeTargetVertexIndices[edgeIndex];
+                if (targetVertexIndex != uint32_t(-1))
+                    targetCluster = &clusters[clusterByVertexIndex[targetVertexIndex]];
                 marginalDensities[edgeOffset] =
-                    IndirectMarginalDensity(edge, cluster, vertexSpan);
+                    IndirectMarginalSegmentDensity(edge, cluster, targetCluster,
+                                                   vertexSpan);
+            }
         }
 
         for (uint32_t vertexOffset = 0; vertexOffset < nVertices; ++vertexOffset) {
@@ -465,14 +547,26 @@ void PathGraphSnapshot::BuildIndirectTransferWeights(
                 if (marginalDensity <= 0)
                     continue;
 
-                ContEdge adjustedEdge =
-                    ContEdgeForVertex(contEdges[cluster.contEdgeIndices[edgeOffset]],
-                                      vertex, vertexSpan);
+                const ContEdge &edge = contEdges[cluster.contEdgeIndices[edgeOffset]];
+                ContEdge adjustedEdge = ContEdgeForVertex(edge, vertex, vertexSpan);
                 SampledSpectrum fcos = fcosEvaluator(vertex, adjustedEdge);
                 if (!fcos)
                     continue;
 
-                weights[vertexOffset * nEdges + edgeOffset] = fcos / marginalDensity;
+                uint32_t targetVertexIndex =
+                    VertexIndexFromId(adjustedEdge.vertexB);
+                if (targetVertexIndex == uint32_t(-1))
+                    continue;
+
+                Float areaJacobian =
+                    SegmentAreaJacobian(vertex, vertices[targetVertexIndex],
+                                        adjustedEdge.wi);
+                if (areaJacobian <= 0)
+                    continue;
+
+                Float kernel = IndirectKernelValue(cluster, edge, vertex);
+                weights[vertexOffset * nEdges + edgeOffset] =
+                    kernel * fcos * areaJacobian / marginalDensity;
             }
         }
     });
@@ -525,7 +619,7 @@ void PathGraphSnapshot::AggregateIndirectLighting(
             for (uint32_t edgeOffset = 0; edgeOffset < nEdges; ++edgeOffset) {
                 uint32_t edgeIndex = cluster.contEdgeIndices[edgeOffset];
                 const ContEdge &edge = contEdges[edgeIndex];
-                if (edge.pdf <= 0 || !edge.L_B)
+                if (edge.pdfForward <= 0 || !edge.L_B)
                     continue;
 
                 const SampledSpectrum &weight =
@@ -571,7 +665,7 @@ void PathGraphSnapshot::FinalGather(
         ContEdge adjustedEdge = ContEdgeForVertex(edge, vertex, vertices);
         Float marginalDensity = 0;
         if (IsSpecular(edge.flags))
-            marginalDensity = edge.pdf;
+            marginalDensity = edge.pdfForward;
         else
             marginalDensity = vertex.bsdf ? vertex.bsdf->PDF(vertex.wo, adjustedEdge.wi) : 0;
         if (marginalDensity <= 0)

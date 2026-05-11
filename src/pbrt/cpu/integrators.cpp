@@ -698,7 +698,14 @@ void TestOneIntegrator::CaptureLightPaths(int nLightPaths) const {
                 edge.vertexA = vertexId;
                 edge.vertexB = previousVertexId;
                 edge.wi = -ray.d;
-                edge.pdf = previousPdf;
+                // The light path was sampled from vertexB to vertexA; that density is
+                // reverse with respect to the aggregation edge A -> B. Evaluate the
+                // forward A -> B density at the current endpoint so the one-sided
+                // Deng-style denominator does not mix directions. Delta reverse
+                // densities that were not actually sampled remain unresolved here and
+                // are left for the SLTS two-ended MMIS pass.
+                edge.pdfForward = bsdf.PDF(vertex.wo, edge.wi, TransportMode::Importance);
+                edge.pdfReverse = previousPdf;
                 edge.flags = previousFlags;
                 pathSink->AddContEdge(edge);
             }
@@ -735,7 +742,7 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
     struct PendingContEdge {
         uint64_t vertexA = 0;
         Vector3f wi;
-        Float pdf = 0;
+        Float pdfForward = 0;
         BxDFFlags flags = BxDFFlags::Unset;
     };
     PendingContEdge pendingContEdge;
@@ -789,7 +796,8 @@ SampledSpectrum TestOneIntegrator::Li(RayDifferential ray, SampledWavelengths &l
             edge.vertexA = pendingContEdge.vertexA;
             edge.vertexB = vertexId;
             edge.wi = pendingContEdge.wi;
-            edge.pdf = pendingContEdge.pdf;
+            edge.pdfForward = pendingContEdge.pdfForward;
+            edge.pdfReverse = bsdf.PDF(wo, -pendingContEdge.wi);
             edge.flags = pendingContEdge.flags;
             pathSink->AddContEdge(edge);
             pendingContEdge = {};

@@ -65,11 +65,24 @@ struct ContEdge {
     uint64_t vertexA = 0;
     uint64_t vertexB = 0;
     SampledSpectrum L_B = SampledSpectrum(0.f);
+
+    // Direction from vertexA toward vertexB. The current aggregation formula
+    // estimates radiance at vertexA by gathering L_B from vertexB, so the
+    // forward density must always correspond to sampling this A -> B direction.
     Vector3f wi;
 
-    Float pdf = 0;
-    
-    /// maybe useless ...
+    // Solid-angle BSDF density for sampling wi at vertexA, i.e.
+    // BSDF_A::PDF(wo_A, wi). This is the denominator used by the current
+    // Deng-style one-sided continuation aggregation.
+    Float pdfForward = 0;
+
+    // Solid-angle BSDF density for sampling the reverse B -> A direction at
+    // vertexB. This is not used by the current one-sided aggregation, but is
+    // required by the upcoming SLTS two-ended MMIS denominator. For delta BSDFs
+    // this value is only meaningful when it came from the actual sampled
+    // direction; otherwise it may be left as 0.
+    Float pdfReverse = 0;
+
     BxDFFlags flags = BxDFFlags::Unset;
 };
 
